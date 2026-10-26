@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -192,7 +192,7 @@ impl FreeDesktopTrash {
             .ok_or_else(|| "Invalid source filename".to_string())?;
 
         // Resolve collision in Trash according to FreeDesktop spec: <name>.<n>.<ext>
-        let target_name = resolve_trash_collision(&files_dir, orig_name);
+        let target_name = resolve_trash_collision(&files_dir, &info_dir, orig_name);
         let target_file_path = files_dir.join(&target_name);
         let target_info_path = info_dir.join(format!("{}.trashinfo", target_name));
 
@@ -214,12 +214,16 @@ impl FreeDesktopTrash {
         let mut rename_successful = false;
 
         if !force_cross_device {
-            if let Ok(()) = fs::rename(source_path, &target_file_path) {
-                rename_successful = true;
-                if let Err(e) = fs::write(&target_info_path, &trashinfo_content) {
-                    // Roll back rename if possible
-                    let _ = fs::rename(&target_file_path, source_path);
-                    return Err(format!("Failed to write .trashinfo: {}", e));
+            // Recheck destination paths immediately before rename
+            if !path_is_occupied(&target_file_path) && !path_is_occupied(&target_info_path) {
+                if let Ok(()) = fs::rename(source_path, &target_file_path) {
+                    rename_successful = true;
+                    if let Err(e) = write_trashinfo_exclusive(&target_info_path, &trashinfo_content)
+                    {
+                        // Roll back rename if possible
+                        let _ = fs::rename(&target_file_path, source_path);
+                        return Err(format!("Failed to write .trashinfo: {}", e));
+                    }
                 }
             }
         }
@@ -270,7 +274,8 @@ impl FreeDesktopTrash {
                 }
             }
 
-            if let Err(info_err) = fs::write(&target_info_path, &trashinfo_content) {
+            if let Err(info_err) = write_trashinfo_exclusive(&target_info_path, &trashinfo_content)
+            {
                 let _ = remove_dir_contents_recursive(&staging_path);
                 let _ = fs::remove_dir(&staging_path);
                 let _ = fs::remove_file(&staging_path);
@@ -278,6 +283,18 @@ impl FreeDesktopTrash {
             }
 
             // Step 4: Finalize staged copy into Trash/files/ (same filesystem rename)
+            // Recheck destination file path is not occupied immediately before finalization
+            if path_is_occupied(&target_file_path) {
+                let _ = fs::remove_file(&target_info_path);
+                let _ = remove_dir_contents_recursive(&staging_path);
+                let _ = fs::remove_dir(&staging_path);
+                let _ = fs::remove_file(&staging_path);
+                return Err(format!(
+                    "Target file path '{}' became occupied before finalization",
+                    target_file_path.display()
+                ));
+            }
+
             if let Err(finalize_err) = fs::rename(&staging_path, &target_file_path) {
                 let _ = fs::remove_file(&target_info_path);
                 let _ = remove_dir_contents_recursive(&staging_path);
@@ -467,10 +484,28 @@ fn parse_trashinfo_file(path: &Path) -> (String, String) {
     )
 }
 
+/// Helper to check if a path exists or is a symlink (including broken symlinks)
+fn path_is_occupied(path: &Path) -> bool {
+    path.exists() || fs::symlink_metadata(path).is_ok()
+}
+
+/// Atomically writes .trashinfo metadata using create_new (O_CREAT | O_EXCL)
+fn write_trashinfo_exclusive(path: &Path, content: &str) -> Result<(), String> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| format!("Failed to create .trashinfo exclusively: {}", e))?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("Failed to write .trashinfo content: {}", e))
+}
+
 /// Resolve FreeDesktop trash naming collision: <base>.<n>.<ext>
-fn resolve_trash_collision(files_dir: &Path, name: &str) -> String {
-    let candidate = files_dir.join(name);
-    if !candidate.exists() {
+/// Ensures neither Trash/files/<name> nor Trash/info/<name>.trashinfo exists.
+fn resolve_trash_collision(files_dir: &Path, info_dir: &Path, name: &str) -> String {
+    let candidate_file = files_dir.join(name);
+    let candidate_info = info_dir.join(format!("{}.trashinfo", name));
+    if !path_is_occupied(&candidate_file) && !path_is_occupied(&candidate_info) {
         return name.to_string();
     }
 
@@ -484,12 +519,23 @@ fn resolve_trash_collision(files_dir: &Path, name: &str) -> String {
             Some(e) => format!("{}.{}.{}", stem, counter, e),
             None => format!("{}.{}", stem, counter),
         };
-        if !files_dir.join(&candidate_name).exists() {
+        let c_file = files_dir.join(&candidate_name);
+        let c_info = info_dir.join(format!("{}.trashinfo", candidate_name));
+        if !path_is_occupied(&c_file) && !path_is_occupied(&c_info) {
             return candidate_name;
         }
         counter += 1;
         if counter > 10000 {
-            return format!("{}.{}", name, counter);
+            let fallback = format!(
+                "{}.{}_{}",
+                name,
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            );
+            return fallback;
         }
     }
 }
@@ -2026,5 +2072,188 @@ mod tests {
 
         let decoded = url_decode_path(&encoded);
         assert_eq!(decoded, sample_path);
+    }
+
+    #[test]
+    fn test_trash_collision_with_orphaned_trashinfo_preserves_metadata() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "spacewise_trash_orphan_meta_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let trash_dir = temp_dir.join("Trash");
+        let work_dir = temp_dir.join("work");
+        fs::create_dir_all(&work_dir).unwrap();
+
+        let trash = FreeDesktopTrash::new(trash_dir.clone());
+        fs::create_dir_all(trash.files_dir()).unwrap();
+        fs::create_dir_all(trash.info_dir()).unwrap();
+
+        // 1. Pre-create an orphaned .trashinfo file in Trash/info/ without any payload in Trash/files/
+        let orphan_info = trash.info_dir().join("report.txt.trashinfo");
+        let orphan_content =
+            "[Trash Info]\nPath=/previous/lost/report.txt\nDeletionDate=2024-01-01T00:00:00\n";
+        fs::write(&orphan_info, orphan_content).unwrap();
+
+        // Ensure payload in files/ does NOT exist
+        assert!(!trash.files_dir().join("report.txt").exists());
+
+        // 2. Now user moves a new file named "report.txt" to trash
+        let source_file = work_dir.join("report.txt");
+        fs::write(&source_file, b"brand new report content").unwrap();
+
+        let (bytes, count) = trash.move_to_trash(&source_file).unwrap();
+        assert_eq!(bytes, 24);
+        assert_eq!(count, 1);
+        assert!(!source_file.exists(), "Source file must be moved to Trash");
+
+        // 3. The new item MUST have received a collision-free name (report.1.txt)
+        let new_trash_file = trash.files_dir().join("report.1.txt");
+        let new_trash_info = trash.info_dir().join("report.1.txt.trashinfo");
+        assert!(
+            new_trash_file.exists(),
+            "New payload must be saved as report.1.txt"
+        );
+        assert!(
+            new_trash_info.exists(),
+            "New metadata must be saved as report.1.txt.trashinfo"
+        );
+        assert_eq!(
+            fs::read(&new_trash_file).unwrap(),
+            b"brand new report content"
+        );
+
+        // 4. CRITICAL: The orphaned metadata file MUST NOT be overwritten!
+        assert!(orphan_info.exists());
+        assert_eq!(fs::read_to_string(&orphan_info).unwrap(), orphan_content);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_trash_collision_with_payload_and_metadata() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("spacewise_trash_dual_col_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let trash_dir = temp_dir.join("Trash");
+        let work_dir = temp_dir.join("work");
+        fs::create_dir_all(&work_dir).unwrap();
+
+        let trash = FreeDesktopTrash::new(trash_dir.clone());
+        fs::create_dir_all(trash.files_dir()).unwrap();
+        fs::create_dir_all(trash.info_dir()).unwrap();
+
+        // Pre-create both files/archive.zip and info/archive.zip.trashinfo
+        let existing_file = trash.files_dir().join("archive.zip");
+        let existing_info = trash.info_dir().join("archive.zip.trashinfo");
+        fs::write(&existing_file, b"original-archive-bytes").unwrap();
+        fs::write(
+            &existing_info,
+            "[Trash Info]\nPath=/home/user/archive.zip\n",
+        )
+        .unwrap();
+
+        // Now move a new file with the same name to Trash
+        let source_file = work_dir.join("archive.zip");
+        fs::write(&source_file, b"new-archive-bytes").unwrap();
+
+        let (bytes, count) = trash.move_to_trash(&source_file).unwrap();
+        assert_eq!(bytes, 17);
+        assert_eq!(count, 1);
+
+        // Should resolve to archive.1.zip
+        let new_file = trash.files_dir().join("archive.1.zip");
+        let new_info = trash.info_dir().join("archive.1.zip.trashinfo");
+        assert!(new_file.exists());
+        assert!(new_info.exists());
+        assert_eq!(fs::read(&new_file).unwrap(), b"new-archive-bytes");
+
+        // Existing payload and info are unchanged
+        assert_eq!(fs::read(&existing_file).unwrap(), b"original-archive-bytes");
+        assert_eq!(
+            fs::read_to_string(&existing_info).unwrap(),
+            "[Trash Info]\nPath=/home/user/archive.zip\n"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_trash_repeated_collisions_requiring_multiple_candidate_names() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("spacewise_trash_multi_col_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let trash_dir = temp_dir.join("Trash");
+        let work_dir = temp_dir.join("work");
+        fs::create_dir_all(&work_dir).unwrap();
+
+        let trash = FreeDesktopTrash::new(trash_dir.clone());
+        fs::create_dir_all(trash.files_dir()).unwrap();
+        fs::create_dir_all(trash.info_dir()).unwrap();
+
+        // Base item: both payload and metadata exist
+        fs::write(trash.files_dir().join("data.txt"), b"payload 0").unwrap();
+        fs::write(trash.info_dir().join("data.txt.trashinfo"), "info 0").unwrap();
+
+        // data.1.txt: only metadata exists (orphaned .trashinfo)
+        fs::write(
+            trash.info_dir().join("data.1.txt.trashinfo"),
+            "info 1 (orphan)",
+        )
+        .unwrap();
+
+        // data.2.txt: only payload exists (orphaned file)
+        fs::write(trash.files_dir().join("data.2.txt"), b"payload 2 (orphan)").unwrap();
+
+        // data.3.txt: both payload and metadata exist
+        fs::write(trash.files_dir().join("data.3.txt"), b"payload 3").unwrap();
+        fs::write(trash.info_dir().join("data.3.txt.trashinfo"), "info 3").unwrap();
+
+        // Now trash a new data.txt
+        let source_file = work_dir.join("data.txt");
+        fs::write(&source_file, b"payload 4 (winner)").unwrap();
+
+        let res = trash.move_to_trash(&source_file);
+        assert!(res.is_ok());
+
+        // Must have skipped 0, 1, 2, and 3, landing on data.4.txt
+        let final_file = trash.files_dir().join("data.4.txt");
+        let final_info = trash.info_dir().join("data.4.txt.trashinfo");
+        assert!(final_file.exists());
+        assert!(final_info.exists());
+        assert_eq!(fs::read(&final_file).unwrap(), b"payload 4 (winner)");
+
+        // All previous items must be 100% preserved
+        assert_eq!(
+            fs::read(trash.files_dir().join("data.txt")).unwrap(),
+            b"payload 0"
+        );
+        assert_eq!(
+            fs::read_to_string(trash.info_dir().join("data.txt.trashinfo")).unwrap(),
+            "info 0"
+        );
+
+        assert_eq!(
+            fs::read_to_string(trash.info_dir().join("data.1.txt.trashinfo")).unwrap(),
+            "info 1 (orphan)"
+        );
+        assert!(!trash.files_dir().join("data.1.txt").exists());
+
+        assert_eq!(
+            fs::read(trash.files_dir().join("data.2.txt")).unwrap(),
+            b"payload 2 (orphan)"
+        );
+        assert!(!trash.info_dir().join("data.2.txt.trashinfo").exists());
+
+        assert_eq!(
+            fs::read(trash.files_dir().join("data.3.txt")).unwrap(),
+            b"payload 3"
+        );
+        assert_eq!(
+            fs::read_to_string(trash.info_dir().join("data.3.txt.trashinfo")).unwrap(),
+            "info 3"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
