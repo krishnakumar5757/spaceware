@@ -239,7 +239,7 @@ Contributions, feedback, and bug reports are welcome!
 
 ## License
 
-The formal open-source license for Spacewise will be finalized and added in an upcoming release preparation step.
+Spacewise is open-source software licensed under the [MIT License](LICENSE). See the [LICENSE](LICENSE) file for the full license text.
 
 ---
 
