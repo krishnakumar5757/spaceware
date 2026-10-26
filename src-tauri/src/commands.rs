@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::cleanup::{discover_real_cleanup_candidates, execute_validated_cleanup};
@@ -11,9 +11,21 @@ use crate::models::{
 };
 use crate::scanner::DirectoryScanner;
 
+#[derive(Debug)]
+pub struct CleanupGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
 pub struct ScannerState {
     pub cancel_flag: Arc<AtomicBool>,
     pub is_scanning: Arc<AtomicBool>,
+    pub is_cleaning: Arc<AtomicBool>,
 }
 
 impl Default for ScannerState {
@@ -21,7 +33,26 @@ impl Default for ScannerState {
         Self {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             is_scanning: Arc::new(AtomicBool::new(false)),
+            is_cleaning: Arc::new(AtomicBool::new(false)),
         }
+    }
+}
+
+impl ScannerState {
+    pub fn try_acquire_cleanup_lock(&self) -> Result<CleanupGuard, String> {
+        if self
+            .is_cleaning
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(
+                "A cleanup operation is already in progress. Please wait for it to complete."
+                    .to_string(),
+            );
+        }
+        Ok(CleanupGuard {
+            flag: Arc::clone(&self.is_cleaning),
+        })
     }
 }
 
@@ -118,16 +149,19 @@ pub fn get_cleanup_candidates() -> Result<Vec<CleanupRecommendation>, String> {
 }
 
 use crate::explorer::{
+    DirectoryListingResult, SelectiveCleanupPreview, SelectiveCleanupRequest,
     execute_selective_cleanup_targets, get_user_home, list_directory_contents,
-    preview_selective_cleanup_targets, reveal_path_in_file_manager, DirectoryListingResult,
-    SelectiveCleanupPreview, SelectiveCleanupRequest,
+    preview_selective_cleanup_targets, reveal_path_in_file_manager,
 };
 
 #[tauri::command]
 pub async fn execute_cleanup(
+    state: State<'_, ScannerState>,
     request: CleanupActionRequest,
 ) -> Result<CleanupExecutionSummary, String> {
+    let guard = state.try_acquire_cleanup_lock()?;
     tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
         execute_validated_cleanup(request, None)
     })
     .await
@@ -194,9 +228,12 @@ pub async fn scan_targets(
             }
         };
 
-        let scan_outcome = scanner.scan_multiple_targets(&target_paths, Some(|progress: ScanProgress| {
-            let _ = app_clone.emit("scan-progress", &progress);
-        }));
+        let scan_outcome = scanner.scan_multiple_targets(
+            &target_paths,
+            Some(|progress: ScanProgress| {
+                let _ = app_clone.emit("scan-progress", &progress);
+            }),
+        );
 
         is_scanning.store(false, Ordering::Relaxed);
         scan_outcome
@@ -219,11 +256,49 @@ pub fn preview_selective_cleanup(paths: Vec<String>) -> Result<SelectiveCleanupP
 
 #[tauri::command]
 pub async fn execute_selective_cleanup(
+    state: State<'_, ScannerState>,
     request: SelectiveCleanupRequest,
 ) -> Result<CleanupExecutionSummary, String> {
+    let guard = state.try_acquire_cleanup_lock()?;
     tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
         execute_selective_cleanup_targets(request, None)
     })
     .await
     .map_err(|e| format!("Selective cleanup execution failed: {}", e))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cleanup_lock_mutual_exclusion_and_raii_release() {
+        let state = ScannerState::default();
+
+        // 1. Initial state is unlocked
+        assert!(!state.is_cleaning.load(Ordering::SeqCst));
+
+        // 2. Acquire lock
+        let guard1 = state.try_acquire_cleanup_lock();
+        assert!(guard1.is_ok(), "Initial acquisition must succeed");
+        assert!(state.is_cleaning.load(Ordering::SeqCst));
+
+        // 3. Second concurrent attempt must be rejected
+        let guard2 = state.try_acquire_cleanup_lock();
+        assert!(guard2.is_err(), "Concurrent acquisition must be rejected");
+        assert!(guard2.unwrap_err().contains("already in progress"));
+
+        // 4. Drop first guard -> must reliably release lock
+        drop(guard1);
+        assert!(
+            !state.is_cleaning.load(Ordering::SeqCst),
+            "Drop must reset is_cleaning"
+        );
+
+        // 5. Subsequent acquisition succeeds
+        let guard3 = state.try_acquire_cleanup_lock();
+        assert!(guard3.is_ok(), "Acquisition after drop must succeed");
+        assert!(state.is_cleaning.load(Ordering::SeqCst));
+    }
 }

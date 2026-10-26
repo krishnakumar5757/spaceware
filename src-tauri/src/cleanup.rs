@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -60,14 +61,26 @@ pub struct FreeDesktopTrashItem {
     pub is_dir: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TrashFaultInjection {
+    pub fail_copy: bool,
+    pub fail_verification: bool,
+    pub fail_metadata_write: bool,
+    pub fail_source_removal: bool,
+}
+
 /// FreeDesktop.org Trash specification helper
 pub struct FreeDesktopTrash {
     pub trash_dir: PathBuf,
+    pub fault_injection: Option<TrashFaultInjection>,
 }
 
 impl FreeDesktopTrash {
     pub fn new(trash_dir: PathBuf) -> Self {
-        Self { trash_dir }
+        Self {
+            trash_dir,
+            fault_injection: None,
+        }
     }
 
     pub fn default_for_user() -> Self {
@@ -150,6 +163,12 @@ impl FreeDesktopTrash {
             return Err("Cannot trash symbolic links".to_string());
         }
 
+        let mode = meta.mode();
+        let file_type_bits = mode & libc::S_IFMT;
+        if file_type_bits == libc::S_IFSOCK || file_type_bits == libc::S_IFIFO {
+            return Err("Cannot trash special files (sockets/FIFOs)".to_string());
+        }
+
         let (size_bytes, file_count) = if meta.is_dir() {
             compute_exact_dir_size(source_path)
         } else {
@@ -158,17 +177,21 @@ impl FreeDesktopTrash {
 
         let files_dir = self.files_dir();
         let info_dir = self.info_dir();
+        let staging_dir = self.trash_dir.join(".staging");
+
         fs::create_dir_all(&files_dir)
             .map_err(|e| format!("Failed to create trash files directory: {}", e))?;
         fs::create_dir_all(&info_dir)
             .map_err(|e| format!("Failed to create trash info directory: {}", e))?;
+        fs::create_dir_all(&staging_dir)
+            .map_err(|e| format!("Failed to create trash staging directory: {}", e))?;
 
         let orig_name = source_path
             .file_name()
             .and_then(|s| s.to_str())
             .ok_or_else(|| "Invalid source filename".to_string())?;
 
-        // Resolve collision in Trash according to FreeDesktop spec: <name>.<n>
+        // Resolve collision in Trash according to FreeDesktop spec: <name>.<n>.<ext>
         let target_name = resolve_trash_collision(&files_dir, orig_name);
         let target_file_path = files_dir.join(&target_name);
         let target_info_path = info_dir.join(format!("{}.trashinfo", target_name));
@@ -179,49 +202,173 @@ impl FreeDesktopTrash {
             .canonicalize()
             .unwrap_or_else(|_| source_path.to_path_buf());
         let abs_source_str = abs_source.to_string_lossy();
+        let encoded_source_path = url_encode_path(&abs_source_str);
 
         let trashinfo_content = format!(
             "[Trash Info]\nPath={}\nDeletionDate={}\n",
-            abs_source_str, now_iso
+            encoded_source_path, now_iso
         );
 
-        fs::write(&target_info_path, trashinfo_content)
-            .map_err(|e| format!("Failed to write .trashinfo: {}", e))?;
+        // Try instantaneous same-filesystem rename first (unless fault injection forces copy)
+        let force_cross_device = self.fault_injection.as_ref().is_some();
+        let mut rename_successful = false;
 
-        // Move the file or folder
-        if let Err(rename_err) = fs::rename(source_path, &target_file_path) {
-            // If cross-filesystem EXDEV error, copy recursively and remove original
-            if rename_err.raw_os_error() == Some(libc::EXDEV) {
-                if let Err(copy_err) = safe_copy_and_remove(source_path, &target_file_path) {
-                    let _ = fs::remove_file(&target_info_path);
-                    return Err(format!("Cross-device trash copy failed: {}", copy_err));
+        if !force_cross_device {
+            if let Ok(()) = fs::rename(source_path, &target_file_path) {
+                rename_successful = true;
+                if let Err(e) = fs::write(&target_info_path, &trashinfo_content) {
+                    // Roll back rename if possible
+                    let _ = fs::rename(&target_file_path, source_path);
+                    return Err(format!("Failed to write .trashinfo: {}", e));
                 }
-            } else {
+            }
+        }
+
+        if !rename_successful {
+            // Transactional cross-device copy-verify-finalize-remove sequence
+            let unique_token = format!(
+                "stage_{}_{}_{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+                target_name
+            );
+            let staging_path = staging_dir.join(&unique_token);
+
+            // Step 1: Staged copy (source remains 100% untouched)
+            if let Err(copy_err) =
+                copy_tree_non_destructive(source_path, &staging_path, self.fault_injection.as_ref())
+            {
+                let _ = remove_dir_contents_recursive(&staging_path);
+                let _ = fs::remove_dir(&staging_path);
+                let _ = fs::remove_file(&staging_path);
+                return Err(format!("Cross-device trash copy failed: {}", copy_err));
+            }
+
+            // Step 2: Verification of staged copy
+            if let Err(verify_err) =
+                verify_staged_copy(source_path, &staging_path, self.fault_injection.as_ref())
+            {
+                let _ = remove_dir_contents_recursive(&staging_path);
+                let _ = fs::remove_dir(&staging_path);
+                let _ = fs::remove_file(&staging_path);
+                return Err(format!(
+                    "Verification of staged trash copy failed: {}",
+                    verify_err
+                ));
+            }
+
+            // Step 3: Write metadata
+            if let Some(f) = self.fault_injection.as_ref() {
+                if f.fail_metadata_write {
+                    let _ = remove_dir_contents_recursive(&staging_path);
+                    let _ = fs::remove_dir(&staging_path);
+                    let _ = fs::remove_file(&staging_path);
+                    return Err("Simulated fault: failed writing .trashinfo".to_string());
+                }
+            }
+
+            if let Err(info_err) = fs::write(&target_info_path, &trashinfo_content) {
+                let _ = remove_dir_contents_recursive(&staging_path);
+                let _ = fs::remove_dir(&staging_path);
+                let _ = fs::remove_file(&staging_path);
+                return Err(format!("Failed to write .trashinfo metadata: {}", info_err));
+            }
+
+            // Step 4: Finalize staged copy into Trash/files/ (same filesystem rename)
+            if let Err(finalize_err) = fs::rename(&staging_path, &target_file_path) {
                 let _ = fs::remove_file(&target_info_path);
-                return Err(format!("Failed to move file to trash: {}", rename_err));
+                let _ = remove_dir_contents_recursive(&staging_path);
+                let _ = fs::remove_dir(&staging_path);
+                let _ = fs::remove_file(&staging_path);
+                return Err(format!(
+                    "Failed to finalize staged copy into trash: {}",
+                    finalize_err
+                ));
+            }
+
+            // Step 5: Source removal (only now that data is verified and finalized in Trash)
+            let removal_failed = if let Some(f) = self.fault_injection.as_ref() {
+                f.fail_source_removal
+            } else {
+                false
+            };
+
+            let remove_res = if removal_failed {
+                Err("Simulated fault: source removal error".to_string())
+            } else if meta.is_dir() {
+                remove_dir_contents_recursive(source_path)
+                    .and_then(|_| fs::remove_dir(source_path).map_err(|e| e.to_string()))
+            } else {
+                fs::remove_file(source_path).map_err(|e| e.to_string())
+            };
+
+            if let Err(rem_err) = remove_res {
+                // Verified copy is in Trash! We preserve it and report honest partial failure
+                return Err(format!(
+                    "Item was safely copied and verified in Trash ('{}'), but source could not be fully removed: {}. Source remainder and Trash copy both exist.",
+                    target_name, rem_err
+                ));
             }
         }
 
         Ok((size_bytes, file_count))
     }
 
-    /// Permanently removes an item and its .trashinfo from Trash
+    /// Permanently removes an item and its .trashinfo from Trash with strict path validation
     pub fn delete_permanently(&self, item_name: &str) -> Result<(u64, u64), String> {
-        let files_path = self.files_dir().join(item_name);
-        let info_path = self.info_dir().join(format!("{}.trashinfo", item_name));
+        let trimmed = item_name.trim();
+        if trimmed.is_empty() {
+            return Err("Trash item name cannot be empty".to_string());
+        }
 
-        if !files_path.exists() && !info_path.exists() {
-            return Err(format!("Trash item '{}' does not exist", item_name));
+        if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains('\0') {
+            return Err(
+                "Trash item name contains illegal path separators or control characters"
+                    .to_string(),
+            );
+        }
+
+        if trimmed == "." || trimmed == ".." || trimmed.contains("..") {
+            return Err("Trash item name cannot contain relative path traversal".to_string());
+        }
+
+        if Path::new(trimmed).components().count() != 1 {
+            return Err("Trash item name must be a single filename component".to_string());
+        }
+
+        let files_dir = self.files_dir();
+        let info_dir = self.info_dir();
+        let files_path = files_dir.join(trimmed);
+        let info_path = info_dir.join(format!("{}.trashinfo", trimmed));
+
+        if files_path.parent() != Some(&files_dir) || info_path.parent() != Some(&info_dir) {
+            return Err(
+                "Trash item target resolves outside designated trash directory".to_string(),
+            );
+        }
+
+        let files_exists = files_path.exists() || fs::symlink_metadata(&files_path).is_ok();
+        let info_exists = info_path.exists() || fs::symlink_metadata(&info_path).is_ok();
+
+        if !files_exists && !info_exists {
+            return Err(format!("Trash item '{}' does not exist", trimmed));
         }
 
         let mut freed_bytes: u64 = 0;
         let mut freed_files: u64 = 0;
 
-        if files_path.exists() {
+        if files_exists {
             let meta = fs::symlink_metadata(&files_path)
                 .map_err(|e| format!("Failed to stat trash file: {}", e))?;
 
-            if meta.is_dir() {
+            if meta.file_type().is_symlink() {
+                fs::remove_file(&files_path)
+                    .map_err(|e| format!("Failed to remove trash symlink: {}", e))?;
+                freed_files += 1;
+            } else if meta.is_dir() {
                 let (bytes, count) = remove_dir_contents_recursive(&files_path)?;
                 fs::remove_dir(&files_path)
                     .map_err(|e| format!("Failed to remove trash directory root: {}", e))?;
@@ -236,12 +383,50 @@ impl FreeDesktopTrash {
             }
         }
 
-        if info_path.exists() {
+        if info_exists {
             let _ = fs::remove_file(info_path);
         }
 
         Ok((freed_bytes, freed_files))
     }
+}
+
+/// Percent-encodes a path according to the FreeDesktop Trash specification
+pub fn url_encode_path(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+    for b in path.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                encoded.push(b as char);
+            }
+            _ => {
+                encoded.push_str(&format!("%{:02X}", b));
+            }
+        }
+    }
+    encoded
+}
+
+/// Percent-decodes a path from a .trashinfo file
+pub fn url_decode_path(input: &str) -> String {
+    let mut bytes = Vec::with_capacity(input.len());
+    let input_bytes = input.as_bytes();
+    let mut i = 0;
+    while i < input_bytes.len() {
+        if input_bytes[i] == b'%' && i + 2 < input_bytes.len() {
+            if let Ok(byte_val) = u8::from_str_radix(
+                std::str::from_utf8(&input_bytes[i + 1..i + 3]).unwrap_or(""),
+                16,
+            ) {
+                bytes.push(byte_val);
+                i += 3;
+                continue;
+            }
+        }
+        bytes.push(input_bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&bytes).to_string()
 }
 
 /// Helper to parse a .trashinfo INI file
@@ -262,15 +447,23 @@ fn parse_trashinfo_file(path: &Path) -> (String, String) {
     for line in content.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("Path=") {
-            orig_path = rest.to_string();
+            orig_path = url_decode_path(rest);
         } else if let Some(rest) = trimmed.strip_prefix("DeletionDate=") {
             del_date = rest.to_string();
         }
     }
 
     (
-        if orig_path.is_empty() { "Unknown".to_string() } else { orig_path },
-        if del_date.is_empty() { "Unknown".to_string() } else { del_date },
+        if orig_path.is_empty() {
+            "Unknown".to_string()
+        } else {
+            orig_path
+        },
+        if del_date.is_empty() {
+            "Unknown".to_string()
+        } else {
+            del_date
+        },
     )
 }
 
@@ -367,7 +560,8 @@ pub fn remove_dir_contents_recursive(dir: &Path) -> Result<(u64, u64), String> {
     let mut bytes_freed: u64 = 0;
     let mut files_removed: u64 = 0;
 
-    let entries = fs::read_dir(dir).map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
+    let entries = fs::read_dir(dir)
+        .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
 
     for entry in entries {
         let entry = match entry {
@@ -432,8 +626,18 @@ pub fn compute_exact_dir_size(dir: &Path) -> (u64, u64) {
     (total_bytes, total_files)
 }
 
-/// Safe copy and remove for cross-device moves without following symlinks
-fn safe_copy_and_remove(src: &Path, dst: &Path) -> Result<(), String> {
+/// Non-destructive tree copy for staging during cross-device operations
+fn copy_tree_non_destructive(
+    src: &Path,
+    dst: &Path,
+    fault: Option<&TrashFaultInjection>,
+) -> Result<(), String> {
+    if let Some(f) = fault {
+        if f.fail_copy {
+            return Err("Simulated fault: copy failed".to_string());
+        }
+    }
+
     let meta = fs::symlink_metadata(src).map_err(|e| e.to_string())?;
 
     if meta.is_dir() {
@@ -441,29 +645,188 @@ fn safe_copy_and_remove(src: &Path, dst: &Path) -> Result<(), String> {
         for entry in fs::read_dir(src).map_err(|e| e.to_string())?.flatten() {
             let sub_src = entry.path();
             let sub_dst = dst.join(entry.file_name());
-            safe_copy_and_remove(&sub_src, &sub_dst)?;
+            copy_tree_non_destructive(&sub_src, &sub_dst, fault)?;
         }
-        fs::remove_dir(src).map_err(|e| e.to_string())?;
     } else if meta.file_type().is_symlink() {
-        return Err("Will not copy symlinks across filesystems".to_string());
-    } else {
+        let link_target = fs::read_link(src).map_err(|e| e.to_string())?;
+        std::os::unix::fs::symlink(&link_target, dst).map_err(|e| e.to_string())?;
+    } else if meta.is_file() {
         fs::copy(src, dst).map_err(|e| e.to_string())?;
-        fs::remove_file(src).map_err(|e| e.to_string())?;
+    } else {
+        return Err(format!(
+            "Unsupported special file type at {}",
+            src.display()
+        ));
     }
 
     Ok(())
 }
 
-/// Validates that a path is safe for cleanup operations
-pub fn validate_cleanup_path(path: &Path) -> Result<PathBuf, String> {
+/// Verifies that a staged copy matches the source directory or file
+fn verify_staged_copy(
+    src: &Path,
+    dst: &Path,
+    fault: Option<&TrashFaultInjection>,
+) -> Result<(), String> {
+    if let Some(f) = fault {
+        if f.fail_verification {
+            return Err("Simulated fault: verification failed".to_string());
+        }
+    }
+
+    let src_meta = fs::symlink_metadata(src).map_err(|e| {
+        format!(
+            "Failed to read metadata for source {}: {}",
+            src.display(),
+            e
+        )
+    })?;
+    let dst_meta = fs::symlink_metadata(dst).map_err(|e| {
+        format!(
+            "Failed to read metadata for staged copy {}: {}",
+            dst.display(),
+            e
+        )
+    })?;
+
+    if src_meta.is_dir() {
+        if !dst_meta.is_dir() {
+            return Err(format!(
+                "Source is a directory but staged copy is not: {}",
+                dst.display()
+            ));
+        }
+        for entry in fs::read_dir(src).map_err(|e| e.to_string())?.flatten() {
+            let sub_src = entry.path();
+            let sub_dst = dst.join(entry.file_name());
+            verify_staged_copy(&sub_src, &sub_dst, fault)?;
+        }
+    } else if src_meta.file_type().is_symlink() {
+        if !dst_meta.file_type().is_symlink() {
+            return Err(format!(
+                "Source is a symlink but staged copy is not: {}",
+                dst.display()
+            ));
+        }
+        let src_link = fs::read_link(src).map_err(|e| e.to_string())?;
+        let dst_link = fs::read_link(dst).map_err(|e| e.to_string())?;
+        if src_link != dst_link {
+            return Err(format!(
+                "Symlink target mismatch: {:?} vs {:?}",
+                src_link, dst_link
+            ));
+        }
+    } else if src_meta.is_file() {
+        if !dst_meta.is_file() {
+            return Err(format!(
+                "Source is a file but staged copy is not: {}",
+                dst.display()
+            ));
+        }
+        if src_meta.len() != dst_meta.len() {
+            return Err(format!(
+                "File size mismatch: {} vs {}",
+                src_meta.len(),
+                dst_meta.len()
+            ));
+        }
+        // Byte-for-byte content comparison for regular files
+        let mut src_file = fs::File::open(src).map_err(|e| e.to_string())?;
+        let mut dst_file = fs::File::open(dst).map_err(|e| e.to_string())?;
+        let mut buf_src = [0u8; 65536];
+        let mut buf_dst = [0u8; 65536];
+        loop {
+            let n_src = src_file.read(&mut buf_src).map_err(|e| e.to_string())?;
+            let n_dst = dst_file.read(&mut buf_dst).map_err(|e| e.to_string())?;
+            if n_src != n_dst {
+                return Err("Byte count mismatch during content verification".to_string());
+            }
+            if n_src == 0 {
+                break;
+            }
+            if buf_src[..n_src] != buf_dst[..n_dst] {
+                return Err("Byte-for-byte content mismatch during verification".to_string());
+            }
+        }
+    } else {
+        return Err(format!(
+            "Unsupported special file type at {}",
+            src.display()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Retrieves and validates the current user's HOME directory, failing closed if missing or invalid
+pub fn get_validated_home_dir() -> Result<PathBuf, String> {
+    let home =
+        std::env::var("HOME").map_err(|_| "HOME environment variable is not set".to_string())?;
+    if home.trim().is_empty() {
+        return Err("HOME environment variable is empty".to_string());
+    }
+    let home_path = PathBuf::from(&home);
+    if !home_path.is_absolute() {
+        return Err("HOME environment variable must be an absolute path".to_string());
+    }
+    let canonical = home_path.canonicalize().map_err(|e| {
+        format!(
+            "Cannot resolve HOME directory '{}': {}",
+            home_path.display(),
+            e
+        )
+    })?;
+
+    let canonical_str = canonical.to_string_lossy();
+    if canonical_str == "/" || PROTECTED_SYSTEM_PATHS.contains(&canonical_str.as_ref()) {
+        return Err(format!(
+            "HOME cannot be root or a system directory: {}",
+            canonical.display()
+        ));
+    }
+
+    let meta = fs::symlink_metadata(&canonical)
+        .map_err(|e| format!("Cannot access HOME metadata: {}", e))?;
+    if meta.file_type().is_symlink() {
+        return Err("HOME directory cannot be a symbolic link".to_string());
+    }
+
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
+        return Err(format!(
+            "HOME directory '{}' is owned by UID {} but process is running as UID {}",
+            canonical.display(),
+            meta.uid(),
+            euid
+        ));
+    }
+
+    Ok(canonical)
+}
+
+/// Validates that a path is safe for cleanup operations with an explicit home root
+pub fn validate_cleanup_path_with_home(
+    path: &Path,
+    home_canonical: &Path,
+) -> Result<PathBuf, String> {
     let path_str = path.to_string_lossy();
 
-    // Check path traversal
+    // 1. Reject empty
+    if path_str.trim().is_empty() {
+        return Err("Cleanup path cannot be empty".to_string());
+    }
+
+    // 2. Reject relative paths
+    if !path.is_absolute() {
+        return Err("Relative paths are strictly prohibited for cleanup".to_string());
+    }
+
+    // 3. Reject path traversal
     if path_str.contains("..") {
         return Err("Path traversal (..) is strictly rejected".to_string());
     }
 
-    // Check if the input path itself is a symlink before canonicalizing
+    // 4. Reject symlink input before canonicalization
     let orig_meta = fs::symlink_metadata(path)
         .map_err(|e| format!("Failed to read metadata for {}: {}", path.display(), e))?;
 
@@ -471,72 +834,123 @@ pub fn validate_cleanup_path(path: &Path) -> Result<PathBuf, String> {
         return Err("Symbolic links cannot be target of cleanup".to_string());
     }
 
+    // 5. Canonicalize
     let canonical = path
         .canonicalize()
         .map_err(|e| format!("Failed to canonicalize path {}: {}", path.display(), e))?;
 
     let canonical_str = canonical.to_string_lossy();
 
-    // Reject root and protected system paths
+    // 6. Reject root and protected system paths
+    if canonical_str == "/" {
+        return Err("Filesystem root cannot be cleaned".to_string());
+    }
     for &sys_path in PROTECTED_SYSTEM_PATHS {
         if canonical_str == sys_path {
-            return Err(format!("Protected system root cannot be cleaned: {}", sys_path));
+            return Err(format!(
+                "Protected system root cannot be cleaned: {}",
+                sys_path
+            ));
         }
     }
 
-    let home = std::env::var("HOME").unwrap_or_default();
-    if !home.is_empty() {
-        let home_canonical = PathBuf::from(&home).canonicalize().unwrap_or_else(|_| PathBuf::from(&home));
-        if canonical == home_canonical {
-            return Err("User home root cannot be cleaned".to_string());
-        }
-
-        // Check protected user subpaths
-        for &sub in PROTECTED_USER_SUBPATHS {
-            let protected = home_canonical.join(sub);
-            if canonical == protected || canonical.starts_with(&protected) {
-                return Err(format!("Protected user configuration path cannot be cleaned: {}", sub));
-            }
-        }
-
-        // Allow approved cleanup areas:
-        // 1. ~/.cache/<subpath>
-        // 2. ~/.local/share/Trash/<subpath>
-        // 3. /tmp/<subpath> owned by user
-        let cache_root = home_canonical.join(".cache");
-        let trash_root = home_canonical.join(".local/share/Trash");
-        let tmp_root = PathBuf::from("/tmp");
-
-        if canonical == cache_root {
-            return Err("Entire ~/.cache cannot be wiped directly; select specific subdirectories".to_string());
-        }
-
-        let is_in_cache = canonical.starts_with(&cache_root) && canonical != cache_root;
-        let is_in_trash = canonical.starts_with(&trash_root);
-        let is_in_tmp = canonical.starts_with(&tmp_root) && canonical != tmp_root;
-
-        if !is_in_cache && !is_in_trash && !is_in_tmp {
-            // Check if it's an approved project build target
-            let file_name = canonical.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            let is_build_target = (file_name == "target" && canonical.join("CACHEDIR.TAG").exists())
-                || file_name == ".pytest_cache"
-                || file_name == ".turbo";
-
-            if !is_build_target {
-                return Err(format!("Path is outside permitted user cache, trash, and build boundaries: {}", canonical.display()));
-            }
-        }
-    }
-
-    // Verify not a symlink
-    let meta = fs::symlink_metadata(&canonical)
+    // 7. Verify not symlink after canonicalization
+    let canonical_meta = fs::symlink_metadata(&canonical)
         .map_err(|e| format!("Failed to read metadata for {}: {}", canonical.display(), e))?;
 
-    if meta.file_type().is_symlink() {
+    if canonical_meta.file_type().is_symlink() {
         return Err("Symbolic links cannot be target of cleanup".to_string());
     }
 
+    // 8. User home boundaries
+    if canonical == *home_canonical {
+        return Err("User home root cannot be cleaned directly".to_string());
+    }
+
+    // Check protected user subpaths (.config, .ssh, .gnupg, etc.)
+    for &sub in PROTECTED_USER_SUBPATHS {
+        let protected = home_canonical.join(sub);
+        if canonical == protected || canonical.starts_with(&protected) {
+            return Err(format!(
+                "Protected user configuration path cannot be cleaned: {}",
+                sub
+            ));
+        }
+    }
+
+    // Prevent deleting critical top-level folders directly
+    let local_share = home_canonical.join(".local/share");
+    if canonical == local_share || canonical == home_canonical.join(".local") {
+        return Err("Protected user data root cannot be cleaned directly".to_string());
+    }
+
+    // 9. Check approved zones
+    let cache_root = home_canonical.join(".cache");
+    let trash_root = home_canonical.join(".local/share/Trash");
+    let tmp_root = PathBuf::from("/tmp");
+
+    if canonical == cache_root {
+        return Err(
+            "Entire ~/.cache cannot be wiped directly; select specific subdirectories".to_string(),
+        );
+    }
+
+    let is_in_home = canonical.starts_with(home_canonical);
+    let is_in_cache = canonical.starts_with(&cache_root) && canonical != cache_root;
+    let is_in_trash = canonical.starts_with(&trash_root);
+    let is_in_tmp = !is_in_home && canonical.starts_with(&tmp_root) && canonical != tmp_root;
+
+    if is_in_tmp {
+        let euid = unsafe { libc::geteuid() };
+        if orig_meta.uid() != euid || canonical_meta.uid() != euid {
+            return Err(format!(
+                "Refusing to target file in /tmp not owned by current user (UID {})",
+                euid
+            ));
+        }
+        let mode = canonical_meta.mode();
+        let file_type_bits = mode & libc::S_IFMT;
+        if file_type_bits == libc::S_IFSOCK || file_type_bits == libc::S_IFIFO {
+            return Err("Special files (sockets/FIFOs) in /tmp cannot be cleaned".to_string());
+        }
+        let name = canonical.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let is_temp_cache = name.starts_with("rustc")
+            || name.starts_with("cargo")
+            || name.starts_with("pip-")
+            || name.starts_with("npm-")
+            || name.ends_with(".cache")
+            || name.ends_with(".tmp");
+        if !is_temp_cache {
+            return Err(format!(
+                "Arbitrary /tmp target '{}' is not an approved temporary cache pattern",
+                canonical.display()
+            ));
+        }
+    }
+
+    if !is_in_cache && !is_in_trash && !is_in_tmp {
+        // Check if it's an approved project build target
+        let file_name = canonical.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let is_build_target = (file_name == "target" && canonical.join("CACHEDIR.TAG").exists())
+            || file_name == ".pytest_cache"
+            || file_name == ".turbo";
+
+        // Must still be inside user home if it's a build target
+        if !is_build_target || !canonical.starts_with(home_canonical) {
+            return Err(format!(
+                "Path is outside permitted user cache, trash, and build boundaries: {}",
+                canonical.display()
+            ));
+        }
+    }
+
     Ok(canonical)
+}
+
+/// Validates that a path is safe for cleanup operations using the authenticated user home
+pub fn validate_cleanup_path(path: &Path) -> Result<PathBuf, String> {
+    let home = get_validated_home_dir()?;
+    validate_cleanup_path_with_home(path, &home)
 }
 
 /// Approved cache definition table for safe candidate discovery
@@ -700,7 +1114,10 @@ pub fn discover_real_cleanup_candidates() -> Vec<CleanupRecommendation> {
                 risk_level: "caution".to_string(),
                 path: item.files_path.to_string_lossy().to_string(),
                 checked: false,
-                reason: Some(format!("Individual file discarded from {}", item.original_path)),
+                reason: Some(format!(
+                    "Individual file discarded from {}",
+                    item.original_path
+                )),
                 action_type: Some("permanent_delete".to_string()),
                 manual_command: None,
             });
@@ -836,6 +1253,18 @@ pub fn execute_validated_cleanup(
         }
     }
 
+    // Validate action upfront - strictly reject empty, unknown, or malformed actions
+    let is_trash = match request.action.as_str() {
+        "trash" => true,
+        "permanent_delete" => false,
+        unknown => {
+            return Err(format!(
+                "Unknown or invalid cleanup action '{}'. Allowed actions are 'trash' and 'permanent_delete'",
+                unknown
+            ));
+        }
+    };
+
     let discovered = discover_real_cleanup_candidates();
     let trash = match trash_override {
         Some(p) => FreeDesktopTrash::new(p.to_path_buf()),
@@ -860,7 +1289,9 @@ pub fn execute_validated_cleanup(
                     success: false,
                     bytes_freed: 0,
                     files_removed: 0,
-                    error: Some("Candidate ID was not found in active verified candidates list".to_string()),
+                    error: Some(
+                        "Candidate ID was not found in active verified candidates list".to_string(),
+                    ),
                 });
                 continue;
             }
@@ -933,7 +1364,7 @@ pub fn execute_validated_cleanup(
         }
 
         // 5. Execute action: Move to Trash vs Permanent Deletion
-        let (bytes_freed, files_removed, error) = if request.action == "trash" {
+        let (bytes_freed, files_removed, error) = if is_trash {
             // FreeDesktop Trash move
             match trash.move_to_trash(&validated_path) {
                 Ok((bytes, count)) => (bytes, count, None),
@@ -975,7 +1406,11 @@ pub fn execute_validated_cleanup(
                 // or remove and recreate directory
                 match remove_dir_contents_recursive(&validated_path) {
                     Ok((b, f)) => (b, f, None),
-                    Err(e) => (0, 0, Some(format!("Failed to remove directory contents: {}", e))),
+                    Err(e) => (
+                        0,
+                        0,
+                        Some(format!("Failed to remove directory contents: {}", e)),
+                    ),
                 }
             } else {
                 let len = meta.len();
@@ -1053,12 +1488,16 @@ mod tests {
 
     #[test]
     fn test_validate_path_rejects_symlinks() {
-        let temp_dir = std::env::temp_dir().join(format!("spacewise_cleanup_symlink_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("spacewise_cleanup_symlink_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
 
         let real_file = temp_dir.join("real.txt");
-        fs::File::create(&real_file).unwrap().write_all(b"content").unwrap();
+        fs::File::create(&real_file)
+            .unwrap()
+            .write_all(b"content")
+            .unwrap();
 
         let symlink = temp_dir.join("link_to_real");
         #[cfg(unix)]
@@ -1072,7 +1511,8 @@ mod tests {
 
     #[test]
     fn test_freedesktop_trash_create_and_metadata() {
-        let temp_dir = std::env::temp_dir().join(format!("spacewise_trash_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("spacewise_trash_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         let trash_dir = temp_dir.join("Trash");
         let work_dir = temp_dir.join("work");
@@ -1082,7 +1522,10 @@ mod tests {
 
         // Create a test file
         let file_path = work_dir.join("document.txt");
-        fs::File::create(&file_path).unwrap().write_all(b"important data to trash").unwrap();
+        fs::File::create(&file_path)
+            .unwrap()
+            .write_all(b"important data to trash")
+            .unwrap();
 
         let (bytes, count) = trash.move_to_trash(&file_path).unwrap();
         assert_eq!(bytes, 23);
@@ -1109,7 +1552,10 @@ mod tests {
 
         // Test collision handling: trash another document.txt
         let file_path_2 = work_dir.join("document.txt");
-        fs::File::create(&file_path_2).unwrap().write_all(b"second document").unwrap();
+        fs::File::create(&file_path_2)
+            .unwrap()
+            .write_all(b"second document")
+            .unwrap();
         trash.move_to_trash(&file_path_2).unwrap();
 
         // Second should be document.1.txt
@@ -1121,7 +1567,8 @@ mod tests {
 
     #[test]
     fn test_freedesktop_trash_permanent_delete() {
-        let temp_dir = std::env::temp_dir().join(format!("spacewise_trash_del_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("spacewise_trash_del_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         let trash_dir = temp_dir.join("Trash");
         let work_dir = temp_dir.join("work");
@@ -1130,7 +1577,10 @@ mod tests {
         let trash = FreeDesktopTrash::new(trash_dir.clone());
 
         let file_path = work_dir.join("garbage.bin");
-        fs::File::create(&file_path).unwrap().write_all(&vec![b'X'; 500]).unwrap();
+        fs::File::create(&file_path)
+            .unwrap()
+            .write_all(&vec![b'X'; 500])
+            .unwrap();
         trash.move_to_trash(&file_path).unwrap();
 
         assert_eq!(trash.list_items().len(), 1);
@@ -1147,15 +1597,23 @@ mod tests {
 
     #[test]
     fn test_remove_dir_contents_recursive_measures_exact_bytes() {
-        let temp_dir = std::env::temp_dir().join(format!("spacewise_dir_del_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("spacewise_dir_del_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         let sub = temp_dir.join("cache/sub");
         fs::create_dir_all(&sub).unwrap();
 
-        fs::File::create(temp_dir.join("cache/a.tmp")).unwrap().write_all(&vec![b'A'; 100]).unwrap();
-        fs::File::create(sub.join("b.tmp")).unwrap().write_all(&vec![b'B'; 200]).unwrap();
+        fs::File::create(temp_dir.join("cache/a.tmp"))
+            .unwrap()
+            .write_all(&vec![b'A'; 100])
+            .unwrap();
+        fs::File::create(sub.join("b.tmp"))
+            .unwrap()
+            .write_all(&vec![b'B'; 200])
+            .unwrap();
 
-        let (freed_bytes, freed_files) = remove_dir_contents_recursive(&temp_dir.join("cache")).unwrap();
+        let (freed_bytes, freed_files) =
+            remove_dir_contents_recursive(&temp_dir.join("cache")).unwrap();
         assert_eq!(freed_bytes, 300);
         assert_eq!(freed_files, 2);
 
@@ -1173,12 +1631,19 @@ mod tests {
             action: "permanent_delete".to_string(),
         };
 
-        let temp_trash = std::env::temp_dir().join(format!("spacewise_test_trash_pac_{}", std::process::id()));
+        let temp_trash =
+            std::env::temp_dir().join(format!("spacewise_test_trash_pac_{}", std::process::id()));
         let summary = execute_validated_cleanup(req, Some(&temp_trash)).unwrap();
 
         assert_eq!(summary.failure_count, 1);
         assert_eq!(summary.success_count, 0);
-        assert!(summary.item_results[0].error.as_ref().unwrap().contains("prohibited for system safety"));
+        assert!(
+            summary.item_results[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("prohibited for system safety")
+        );
     }
 
     #[test]
@@ -1188,17 +1653,27 @@ mod tests {
             action: "trash".to_string(),
         };
 
-        let temp_trash = std::env::temp_dir().join(format!("spacewise_test_trash_unk_{}", std::process::id()));
+        let temp_trash =
+            std::env::temp_dir().join(format!("spacewise_test_trash_unk_{}", std::process::id()));
         let summary = execute_validated_cleanup(req, Some(&temp_trash)).unwrap();
 
         assert_eq!(summary.failure_count, 1);
         assert_eq!(summary.success_count, 0);
-        assert!(summary.item_results[0].error.as_ref().unwrap().contains("was not found"));
+        assert!(
+            summary.item_results[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("was not found")
+        );
     }
 
     #[test]
     fn test_cleanup_handles_changed_or_missing_file_before_execution() {
-        let temp_dir = std::env::temp_dir().join(format!("spacewise_changed_file_test_{}", std::process::id()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "spacewise_changed_file_test_{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&temp_dir);
         let trash = FreeDesktopTrash::new(temp_dir.join("Trash"));
 
@@ -1213,13 +1688,19 @@ mod tests {
     fn test_cleanup_handles_permissions_and_preserves_partial_state() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp_dir = std::env::temp_dir().join(format!("spacewise_perm_cleanup_test_{}", std::process::id()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "spacewise_perm_cleanup_test_{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&temp_dir);
         let target_dir = temp_dir.join("cache");
         fs::create_dir_all(&target_dir).unwrap();
 
         let normal_file = target_dir.join("normal.txt");
-        fs::File::create(&normal_file).unwrap().write_all(b"data").unwrap();
+        fs::File::create(&normal_file)
+            .unwrap()
+            .write_all(b"data")
+            .unwrap();
 
         let locked_file = target_dir.join("locked.txt");
         let mut f = fs::File::create(&locked_file).unwrap();
@@ -1238,5 +1719,312 @@ mod tests {
 
         assert!(res.is_ok() || res.is_err());
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_unknown_action_fails_closed_before_mutation() {
+        let invalid_actions = vec![
+            "",
+            "clean",
+            "delete",
+            "trash ",
+            "DESTROY",
+            "remove",
+            "permanent",
+        ];
+
+        for action in invalid_actions {
+            let req = CleanupActionRequest {
+                candidate_ids: vec!["rec-trash-all".to_string()],
+                action: action.to_string(),
+            };
+
+            let temp_trash =
+                std::env::temp_dir().join(format!("spacewise_invalid_act_{}", std::process::id()));
+            let res = execute_validated_cleanup(req, Some(&temp_trash));
+            assert!(res.is_err(), "Action '{}' must be rejected", action);
+            assert!(
+                res.unwrap_err()
+                    .contains("Unknown or invalid cleanup action"),
+                "Must reject before any filesystem mutation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fail_closed_path_validation_with_home() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("spacewise_fail_closed_home_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let fake_home = temp_dir.join("user_home");
+        fs::create_dir_all(&fake_home).unwrap();
+        let fake_home_canonical = fake_home.canonicalize().unwrap();
+
+        // 1. Empty path rejected
+        assert!(validate_cleanup_path_with_home(Path::new(""), &fake_home_canonical).is_err());
+
+        // 2. Relative path rejected
+        assert!(
+            validate_cleanup_path_with_home(Path::new("relative/cache"), &fake_home_canonical)
+                .is_err()
+        );
+
+        // 3. Path traversal rejected
+        assert!(
+            validate_cleanup_path_with_home(Path::new("/tmp/../etc"), &fake_home_canonical)
+                .is_err()
+        );
+
+        // 4. User home root rejected directly
+        assert!(
+            validate_cleanup_path_with_home(&fake_home_canonical, &fake_home_canonical).is_err()
+        );
+
+        // 5. Protected user subpaths rejected
+        let ssh_dir = fake_home_canonical.join(".ssh");
+        fs::create_dir_all(&ssh_dir).unwrap();
+        assert!(validate_cleanup_path_with_home(&ssh_dir, &fake_home_canonical).is_err());
+
+        let config_dir = fake_home_canonical.join(".config");
+        fs::create_dir_all(&config_dir).unwrap();
+        assert!(validate_cleanup_path_with_home(&config_dir, &fake_home_canonical).is_err());
+
+        // 6. Path outside permitted zones rejected
+        let doc_file = fake_home_canonical.join("Documents/tax_return.pdf");
+        fs::create_dir_all(doc_file.parent().unwrap()).unwrap();
+        fs::File::create(&doc_file)
+            .unwrap()
+            .write_all(b"sensitive")
+            .unwrap();
+        assert!(validate_cleanup_path_with_home(&doc_file, &fake_home_canonical).is_err());
+
+        // 7. Approved cache subpath accepted
+        let cache_sub = fake_home_canonical.join(".cache/app_cache");
+        fs::create_dir_all(&cache_sub).unwrap();
+        let res = validate_cleanup_path_with_home(&cache_sub, &fake_home_canonical);
+        assert!(res.is_ok(), "Approved cache subpath must be accepted");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_cross_filesystem_trash_copy_failure_rollback() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("spacewise_xf_copy_fail_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let trash_dir = temp_dir.join("Trash");
+        let work_dir = temp_dir.join("work/nested");
+        fs::create_dir_all(&work_dir).unwrap();
+
+        let test_file = work_dir.join("source.dat");
+        fs::File::create(&test_file)
+            .unwrap()
+            .write_all(b"original source content")
+            .unwrap();
+
+        let mut trash = FreeDesktopTrash::new(trash_dir);
+        trash.fault_injection = Some(TrashFaultInjection {
+            fail_copy: true,
+            fail_verification: false,
+            fail_metadata_write: false,
+            fail_source_removal: false,
+        });
+
+        let target_dir = temp_dir.join("work");
+        let res = trash.move_to_trash(&target_dir);
+        assert!(res.is_err(), "Copy failure must return Err");
+
+        // CRITICAL SAFETY CHECK: Original source must be 100% intact!
+        assert!(
+            test_file.exists(),
+            "Source file must not be deleted on copy failure"
+        );
+        assert_eq!(fs::read(&test_file).unwrap(), b"original source content");
+
+        // Staging directory must be cleaned up
+        let staging_dir = trash.trash_dir.join(".staging");
+        if staging_dir.exists() {
+            assert_eq!(fs::read_dir(&staging_dir).unwrap().count(), 0);
+        }
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_cross_filesystem_trash_verification_failure_rollback() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("spacewise_xf_verify_fail_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let trash_dir = temp_dir.join("Trash");
+        let work_dir = temp_dir.join("work");
+        fs::create_dir_all(&work_dir).unwrap();
+
+        let test_file = work_dir.join("payload.bin");
+        fs::File::create(&test_file)
+            .unwrap()
+            .write_all(b"precious user data")
+            .unwrap();
+
+        let mut trash = FreeDesktopTrash::new(trash_dir);
+        trash.fault_injection = Some(TrashFaultInjection {
+            fail_copy: false,
+            fail_verification: true,
+            fail_metadata_write: false,
+            fail_source_removal: false,
+        });
+
+        let res = trash.move_to_trash(&work_dir);
+        assert!(res.is_err(), "Verification failure must return Err");
+
+        // CRITICAL SAFETY CHECK: Source must remain completely untouched!
+        assert!(
+            test_file.exists(),
+            "Source must remain intact when staged copy verification fails"
+        );
+        assert_eq!(fs::read(&test_file).unwrap(), b"precious user data");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_cross_filesystem_trash_metadata_write_failure_rollback() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("spacewise_xf_meta_fail_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let trash_dir = temp_dir.join("Trash");
+        let work_dir = temp_dir.join("work");
+        fs::create_dir_all(&work_dir).unwrap();
+
+        let test_file = work_dir.join("data.txt");
+        fs::File::create(&test_file)
+            .unwrap()
+            .write_all(b"unaltered data")
+            .unwrap();
+
+        let mut trash = FreeDesktopTrash::new(trash_dir);
+        trash.fault_injection = Some(TrashFaultInjection {
+            fail_copy: false,
+            fail_verification: false,
+            fail_metadata_write: true,
+            fail_source_removal: false,
+        });
+
+        let res = trash.move_to_trash(&work_dir);
+        assert!(res.is_err(), "Metadata failure must return Err");
+
+        // Source must remain completely intact
+        assert!(
+            test_file.exists(),
+            "Source file must not be touched on metadata failure"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_cross_filesystem_trash_source_removal_failure_preserves_trash() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("spacewise_xf_src_rem_fail_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let trash_dir = temp_dir.join("Trash");
+        let work_dir = temp_dir.join("work");
+        fs::create_dir_all(&work_dir).unwrap();
+
+        let test_file = work_dir.join("data.txt");
+        fs::File::create(&test_file)
+            .unwrap()
+            .write_all(b"preserved copy")
+            .unwrap();
+
+        let mut trash = FreeDesktopTrash::new(trash_dir);
+        trash.fault_injection = Some(TrashFaultInjection {
+            fail_copy: false,
+            fail_verification: false,
+            fail_metadata_write: false,
+            fail_source_removal: true,
+        });
+
+        let res = trash.move_to_trash(&work_dir);
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err();
+        assert!(err_msg.contains("safely copied and verified in Trash"));
+        assert!(err_msg.contains("Source remainder and Trash copy both exist"));
+
+        // The verified trash copy and metadata MUST exist in Trash!
+        assert!(
+            trash.files_dir().join("work").exists(),
+            "Trash copy must be preserved"
+        );
+        assert!(
+            trash.info_dir().join("work.trashinfo").exists(),
+            "Trash metadata must be preserved"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_delete_permanently_hardened_traversal_and_separators() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("spacewise_del_perm_harden_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let trash_dir = temp_dir.join("Trash");
+        let trash = FreeDesktopTrash::new(trash_dir.clone());
+        fs::create_dir_all(trash.files_dir()).unwrap();
+        fs::create_dir_all(trash.info_dir()).unwrap();
+
+        // Create an unrelated file inside Trash
+        let legitimate_file = trash.files_dir().join("safe.txt");
+        fs::File::create(&legitimate_file)
+            .unwrap()
+            .write_all(b"do not touch")
+            .unwrap();
+        let legitimate_info = trash.info_dir().join("safe.txt.trashinfo");
+        fs::File::create(&legitimate_info)
+            .unwrap()
+            .write_all(b"[Trash Info]\n")
+            .unwrap();
+
+        // 1. Empty name rejected
+        assert!(trash.delete_permanently("").is_err());
+        assert!(trash.delete_permanently("   ").is_err());
+
+        // 2. Traversal rejected
+        assert!(trash.delete_permanently("../safe.txt").is_err());
+        assert!(trash.delete_permanently("../../etc/passwd").is_err());
+        assert!(trash.delete_permanently(".").is_err());
+        assert!(trash.delete_permanently("..").is_err());
+
+        // 3. Separators and subpaths rejected
+        assert!(trash.delete_permanently("sub/file.txt").is_err());
+        assert!(trash.delete_permanently("/etc/passwd").is_err());
+
+        // Verify unrelated item was not touched
+        assert!(legitimate_file.exists());
+        assert!(legitimate_info.exists());
+
+        // 4. Valid single filename deletes cleanly
+        let res = trash.delete_permanently("safe.txt");
+        assert!(res.is_ok());
+        assert!(!legitimate_file.exists());
+        assert!(!legitimate_info.exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_trashinfo_url_encoding_and_decoding() {
+        let sample_path = "/home/krishna/My Documents/Project #1 (v2.0) [Final] & Test%.txt";
+        let encoded = url_encode_path(sample_path);
+
+        assert!(!encoded.contains(' '));
+        assert!(encoded.contains("%20"));
+        assert!(encoded.contains("%23")); // #
+        assert!(encoded.contains("%25")); // %
+
+        let decoded = url_decode_path(&encoded);
+        assert_eq!(decoded, sample_path);
     }
 }

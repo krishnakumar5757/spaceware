@@ -42,9 +42,27 @@ pub fn unescape_octal_path(input: &str) -> String {
 /// Check if a filesystem type is a physical or user storage filesystem
 pub fn is_physical_or_storage_fs(fs_type: &str, device: &str, mount_point: &str) -> bool {
     let ignored_fs_types = [
-        "proc", "sysfs", "devpts", "securityfs", "cgroup", "cgroup2", "pstore", "bpf",
-        "autofs", "mqueue", "hugetlbfs", "debugfs", "tracefs", "fusectl", "configfs",
-        "ramfs", "devtmpfs", "overlay", "nsfs", "efivarfs", "binfmt_misc",
+        "proc",
+        "sysfs",
+        "devpts",
+        "securityfs",
+        "cgroup",
+        "cgroup2",
+        "pstore",
+        "bpf",
+        "autofs",
+        "mqueue",
+        "hugetlbfs",
+        "debugfs",
+        "tracefs",
+        "fusectl",
+        "configfs",
+        "ramfs",
+        "devtmpfs",
+        "overlay",
+        "nsfs",
+        "efivarfs",
+        "binfmt_misc",
     ];
 
     if ignored_fs_types.contains(&fs_type) {
@@ -91,7 +109,9 @@ pub fn is_physical_or_storage_fs(fs_type: &str, device: &str, mount_point: &str)
 
 /// Calls POSIX `statvfs` safely on a path
 pub fn statvfs_path(path: &Path) -> Result<(u64, u64, u64, u64), String> {
-    let path_str = path.to_str().ok_or_else(|| "Invalid UTF-8 in path".to_string())?;
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| "Invalid UTF-8 in path".to_string())?;
     let path_cstr = CString::new(path_str).map_err(|e| format!("CString error: {}", e))?;
 
     unsafe {
@@ -114,7 +134,8 @@ pub fn statvfs_path(path: &Path) -> Result<(u64, u64, u64, u64), String> {
 
 /// Reads `/proc/mounts` and retrieves all mounted filesystems with capacity stats
 pub fn get_mounted_filesystems() -> Result<Vec<MountedFilesystem>, String> {
-    let file = File::open("/proc/mounts").map_err(|e| format!("Failed to read /proc/mounts: {}", e))?;
+    let file =
+        File::open("/proc/mounts").map_err(|e| format!("Failed to read /proc/mounts: {}", e))?;
     let reader = BufReader::new(file);
 
     let mut mounts = Vec::new();
@@ -170,15 +191,23 @@ pub fn get_mounted_filesystems() -> Result<Vec<MountedFilesystem>, String> {
 }
 
 /// Find the mounted filesystem that best covers the given path
-pub fn find_mount_for_path(target_path: &Path, mounts: &[MountedFilesystem]) -> Option<MountedFilesystem> {
-    let target_canonical = target_path.canonicalize().unwrap_or_else(|_| target_path.to_path_buf());
+pub fn find_mount_for_path(
+    target_path: &Path,
+    mounts: &[MountedFilesystem],
+) -> Option<MountedFilesystem> {
+    let target_canonical = target_path
+        .canonicalize()
+        .unwrap_or_else(|_| target_path.to_path_buf());
     let target_str = target_canonical.to_str().unwrap_or("");
 
     let mut best_match: Option<&MountedFilesystem> = None;
     let mut best_len = 0;
 
     for m in mounts {
-        if target_str == m.mount_point || target_str.starts_with(&format!("{}/", m.mount_point)) || m.mount_point == "/" {
+        if target_str == m.mount_point
+            || target_str.starts_with(&format!("{}/", m.mount_point))
+            || m.mount_point == "/"
+        {
             if m.mount_point.len() >= best_len {
                 best_len = m.mount_point.len();
                 best_match = Some(m);
@@ -250,10 +279,7 @@ mod tests {
             unescape_octal_path("/normal/path/without/escapes"),
             "/normal/path/without/escapes"
         );
-        assert_eq!(
-            unescape_octal_path("/path/with\\011tab"),
-            "/path/with\ttab"
-        );
+        assert_eq!(unescape_octal_path("/path/with\\011tab"), "/path/with\ttab");
     }
 
     #[test]
@@ -270,17 +296,28 @@ mod tests {
     #[test]
     fn test_is_physical_fs_filtering() {
         assert!(is_physical_or_storage_fs("ext4", "/dev/sda1", "/"));
-        assert!(is_physical_or_storage_fs("btrfs", "/dev/nvme0n1p2", "/home"));
+        assert!(is_physical_or_storage_fs(
+            "btrfs",
+            "/dev/nvme0n1p2",
+            "/home"
+        ));
         assert!(!is_physical_or_storage_fs("proc", "proc", "/proc"));
         assert!(!is_physical_or_storage_fs("sysfs", "sysfs", "/sys"));
-        assert!(!is_physical_or_storage_fs("cgroup2", "cgroup2", "/sys/fs/cgroup"));
+        assert!(!is_physical_or_storage_fs(
+            "cgroup2",
+            "cgroup2",
+            "/sys/fs/cgroup"
+        ));
     }
 
     #[test]
     fn test_get_storage_summary_for_path() {
         let temp = std::env::temp_dir();
         let summary = get_storage_summary_for_path(&temp);
-        assert!(summary.is_ok(), "storage summary should succeed for temp dir");
+        assert!(
+            summary.is_ok(),
+            "storage summary should succeed for temp dir"
+        );
         let s = summary.unwrap();
         assert!(s.total_bytes > 0);
         assert!(s.available_bytes <= s.total_bytes);

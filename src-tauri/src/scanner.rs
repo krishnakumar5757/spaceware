@@ -1,10 +1,10 @@
-use std::collections::BinaryHeap;
 use std::cmp::Ordering as CmpOrdering;
+use std::collections::BinaryHeap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::filesystem::get_storage_summary_for_path;
@@ -63,12 +63,21 @@ pub fn classify_file(ext: &str, path_str: &str) -> (&'static str, &'static str) 
         || lower_path.contains("/node_modules/")
         || lower_path.contains("/.cargo/")
         || lower_path.contains("/.gradle/")
-        || ["rs", "ts", "tsx", "js", "jsx", "py", "go", "c", "cpp", "h", "hpp", "java", "json", "toml", "yaml", "yml", "html", "css", "lock", "rlib"].contains(&lower_ext.as_str())
+        || [
+            "rs", "ts", "tsx", "js", "jsx", "py", "go", "c", "cpp", "h", "hpp", "java", "json",
+            "toml", "yaml", "yml", "html", "css", "lock", "rlib",
+        ]
+        .contains(&lower_ext.as_str())
     {
         return ("developer", "Developer & Builds");
     }
 
-    if ["mov", "mp4", "mkv", "avi", "webm", "flac", "wav", "mp3", "aac", "ogg", "png", "jpg", "jpeg", "gif", "webp", "raw", "braw", "svg", "tiff"].contains(&lower_ext.as_str()) {
+    if [
+        "mov", "mp4", "mkv", "avi", "webm", "flac", "wav", "mp3", "aac", "ogg", "png", "jpg",
+        "jpeg", "gif", "webp", "raw", "braw", "svg", "tiff",
+    ]
+    .contains(&lower_ext.as_str())
+    {
         return ("media", "Media & Videos");
     }
 
@@ -81,19 +90,29 @@ pub fn classify_file(ext: &str, path_str: &str) -> (&'static str, &'static str) 
         return ("system", "System & Core");
     }
 
-    if ["bin", "exe", "appimage", "flatpak", "so", "vpk", "pak", "apk"].contains(&lower_ext.as_str())
+    if [
+        "bin", "exe", "appimage", "flatpak", "so", "vpk", "pak", "apk",
+    ]
+    .contains(&lower_ext.as_str())
         || lower_path.contains("/.local/share/flatpak/")
         || lower_path.contains("/steamapps/")
     {
         return ("apps", "Apps & Flatpaks");
     }
 
-    if ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "zip", "gz", "bz2", "7z", "rar", "iso", "tar", "zst", "csv"].contains(&lower_ext.as_str()) {
+    if [
+        "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "zip", "gz", "bz2", "7z",
+        "rar", "iso", "tar", "zst", "csv",
+    ]
+    .contains(&lower_ext.as_str())
+    {
         return ("documents", "Documents & Archives");
     }
 
     ("other", "Other / Unsorted")
 }
+
+pub const MAX_PERMISSION_DENIED_PATHS: usize = 500;
 
 pub struct DirectoryScanner {
     options: ScanOptions,
@@ -105,6 +124,7 @@ pub struct DirectoryScanner {
     largest_files: BinaryHeap<TrackedFile>,
     max_largest: usize,
     categories: Vec<CategoryStats>,
+    permission_denied_count: u64,
     permission_denied_paths: Vec<String>,
     start_time: Instant,
     last_progress_emit: Instant,
@@ -113,7 +133,8 @@ pub struct DirectoryScanner {
 impl DirectoryScanner {
     pub fn new(options: ScanOptions, cancel_flag: Arc<AtomicBool>) -> Result<Self, String> {
         let root = Path::new(&options.path);
-        let root_meta = fs::symlink_metadata(root).map_err(|e| format!("Failed to access root path: {}", e))?;
+        let root_meta =
+            fs::symlink_metadata(root).map_err(|e| format!("Failed to access root path: {}", e))?;
         let root_dev = root_meta.dev();
 
         let categories = vec![
@@ -183,10 +204,19 @@ impl DirectoryScanner {
             largest_files: BinaryHeap::with_capacity(100),
             max_largest: 50,
             categories,
+            permission_denied_count: 0,
             permission_denied_paths: Vec::new(),
             start_time: Instant::now(),
             last_progress_emit: Instant::now(),
         })
+    }
+
+    /// Records a permission-denied error, capping the path list to prevent unbounded memory usage
+    fn record_permission_denied(&mut self, path_str: String) {
+        self.permission_denied_count += 1;
+        if self.permission_denied_paths.len() < MAX_PERMISSION_DENIED_PATHS {
+            self.permission_denied_paths.push(path_str);
+        }
     }
 
     pub fn scan<F>(&mut self, progress_cb: Option<F>) -> Result<ScanResult, String>
@@ -280,7 +310,7 @@ impl DirectoryScanner {
             total_files_scanned: self.total_files,
             total_dirs_scanned: self.total_dirs,
             total_bytes_scanned: self.total_bytes,
-            permission_denied_count: self.permission_denied_paths.len() as u64,
+            permission_denied_count: self.permission_denied_count,
             permission_denied_paths: self.permission_denied_paths.clone(),
             scan_duration_ms,
             is_live_data: true,
@@ -312,7 +342,7 @@ impl DirectoryScanner {
             let meta = match fs::symlink_metadata(target) {
                 Ok(m) => m,
                 Err(e) => {
-                    self.permission_denied_paths.push(format!("{}: {}", target.display(), e));
+                    self.record_permission_denied(format!("{}: {}", target.display(), e));
                     continue;
                 }
             };
@@ -329,8 +359,16 @@ impl DirectoryScanner {
                 child_nodes.push(node);
             } else {
                 let size = meta.len();
-                let name = target.file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string();
-                let ext = target.extension().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                let name = target
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("file")
+                    .to_string();
+                let ext = target
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
                 let path_str = target.to_string_lossy().to_string();
                 let (cat_id, _) = classify_file(&ext, &path_str);
 
@@ -390,7 +428,11 @@ impl DirectoryScanner {
         }
 
         let root_title = if targets.len() == 1 {
-            targets[0].file_name().and_then(|s| s.to_str()).unwrap_or("Selected Target").to_string()
+            targets[0]
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Selected Target")
+                .to_string()
         } else {
             format!("Selected Items ({} targets)", targets.len())
         };
@@ -398,7 +440,10 @@ impl DirectoryScanner {
         let root_path_str = if targets.len() == 1 {
             targets[0].to_string_lossy().to_string()
         } else {
-            targets[0].parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "/".to_string())
+            targets[0]
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "/".to_string())
         };
 
         let tree_node = DirectoryNode {
@@ -491,7 +536,7 @@ impl DirectoryScanner {
             total_files_scanned: self.total_files,
             total_dirs_scanned: self.total_dirs,
             total_bytes_scanned: self.total_bytes,
-            permission_denied_count: self.permission_denied_paths.len() as u64,
+            permission_denied_count: self.permission_denied_count,
             permission_denied_paths: self.permission_denied_paths.clone(),
             scan_duration_ms,
             is_live_data: true,
@@ -518,12 +563,15 @@ impl DirectoryScanner {
             Ok(entries) => entries,
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    self.permission_denied_paths
-                        .push(current_dir.to_string_lossy().to_string());
+                    self.record_permission_denied(current_dir.to_string_lossy().to_string());
                 }
                 return Ok(DirectoryNode {
                     id: format!("node-{}", self.total_dirs),
-                    name: current_dir.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                    name: current_dir
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
                     path: current_dir.to_string_lossy().to_string(),
                     size_bytes: 0,
                     node_type: "folder".to_string(),
@@ -547,8 +595,7 @@ impl DirectoryScanner {
                 Ok(e) => e,
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::PermissionDenied {
-                        self.permission_denied_paths
-                            .push(current_dir.to_string_lossy().to_string());
+                        self.record_permission_denied(current_dir.to_string_lossy().to_string());
                     }
                     continue;
                 }
@@ -558,7 +605,12 @@ impl DirectoryScanner {
             let file_name = entry.file_name().to_string_lossy().to_string();
 
             // Check exclusions
-            if self.options.exclude_paths.iter().any(|ex| file_name == *ex || file_path.to_string_lossy().contains(ex)) {
+            if self
+                .options
+                .exclude_paths
+                .iter()
+                .any(|ex| file_name == *ex || file_path.to_string_lossy().contains(ex))
+            {
                 continue;
             }
 
@@ -567,8 +619,7 @@ impl DirectoryScanner {
                 Ok(m) => m,
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::PermissionDenied {
-                        self.permission_denied_paths
-                            .push(file_path.to_string_lossy().to_string());
+                        self.record_permission_denied(file_path.to_string_lossy().to_string());
                     }
                     continue;
                 }
@@ -591,7 +642,12 @@ impl DirectoryScanner {
 
             if file_type.is_dir() {
                 let should_collect_tree = current_depth < max_tree_depth;
-                let child_node = self.scan_dir_recursive(&file_path, current_depth + 1, max_tree_depth, progress_cb)?;
+                let child_node = self.scan_dir_recursive(
+                    &file_path,
+                    current_depth + 1,
+                    max_tree_depth,
+                    progress_cb,
+                )?;
                 dir_size += child_node.size_bytes;
                 dir_file_count += child_node.file_count.unwrap_or(0);
 
@@ -600,7 +656,11 @@ impl DirectoryScanner {
                 }
             } else if file_type.is_file() {
                 let size = meta.len();
-                let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("").to_string();
+                let ext = file_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_string();
                 let path_str = file_path.to_string_lossy().to_string();
 
                 dir_size += size;
@@ -639,7 +699,8 @@ impl DirectoryScanner {
                 }
 
                 // Progress update every 250 files or 100ms
-                if self.total_files % 250 == 0 && self.last_progress_emit.elapsed().as_millis() > 80 {
+                if self.total_files % 250 == 0 && self.last_progress_emit.elapsed().as_millis() > 80
+                {
                     self.last_progress_emit = Instant::now();
                     if let Some(cb) = progress_cb {
                         cb(ScanProgress {
@@ -672,7 +733,11 @@ impl DirectoryScanner {
             node_type: "folder".to_string(),
             file_count: Some(dir_file_count),
             category: None,
-            children: if child_nodes.is_empty() { None } else { Some(child_nodes) },
+            children: if child_nodes.is_empty() {
+                None
+            } else {
+                Some(child_nodes)
+            },
         })
     }
 
@@ -681,7 +746,6 @@ impl DirectoryScanner {
         crate::cleanup::discover_real_cleanup_candidates()
     }
 }
-
 
 pub fn format_epoch_date(secs: u64) -> String {
     if secs == 0 {
@@ -750,7 +814,8 @@ mod tests {
 
     #[test]
     fn test_symlinks_are_never_followed() {
-        let temp_dir = std::env::temp_dir().join(format!("spacewise_symlink_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("spacewise_symlink_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         let outside_dir = temp_dir.join("outside");
         let inside_dir = temp_dir.join("inside");
@@ -780,14 +845,18 @@ mod tests {
         let result = scanner.scan::<fn(ScanProgress)>(None).unwrap();
 
         // The file inside outside_dir MUST NOT be counted because the symlink directory was not recursed
-        assert_eq!(result.total_files_scanned, 0, "Symlink directory must not be traversed");
+        assert_eq!(
+            result.total_files_scanned, 0,
+            "Symlink directory must not be traversed"
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_scan_cancellation() {
-        let temp_dir = std::env::temp_dir().join(format!("spacewise_cancel_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("spacewise_cancel_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
 
@@ -817,17 +886,24 @@ mod tests {
     #[test]
     fn test_classify_file_types() {
         assert_eq!(classify_file("mov", "/home/user/video.mov").0, "media");
-        assert_eq!(classify_file("rs", "/home/user/code/main.rs").0, "developer");
+        assert_eq!(
+            classify_file("rs", "/home/user/code/main.rs").0,
+            "developer"
+        );
         assert_eq!(classify_file("so", "/usr/lib/libtest.so").0, "system");
         assert_eq!(classify_file("pdf", "/home/user/doc.pdf").0, "documents");
-        assert_eq!(classify_file("appimage", "/home/user/app.appimage").0, "apps");
+        assert_eq!(
+            classify_file("appimage", "/home/user/app.appimage").0,
+            "apps"
+        );
     }
 
     #[test]
     fn test_permission_denied_error_handling() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp_dir = std::env::temp_dir().join(format!("spacewise_perm_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("spacewise_perm_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         let normal_dir = temp_dir.join("normal");
         let restricted_dir = temp_dir.join("restricted");
@@ -866,24 +942,37 @@ mod tests {
         restore.set_mode(0o755);
         let _ = fs::set_permissions(&restricted_dir, restore);
 
-        assert!(result.is_ok(), "Scan must succeed even with permission denied directories");
+        assert!(
+            result.is_ok(),
+            "Scan must succeed even with permission denied directories"
+        );
         let scan_res = result.unwrap();
 
         // Must have recorded permission denied
-        assert!(scan_res.permission_denied_count >= 1, "Must record at least 1 permission-denied path");
         assert!(
-            scan_res.permission_denied_paths.iter().any(|p| p.contains("restricted")),
+            scan_res.permission_denied_count >= 1,
+            "Must record at least 1 permission-denied path"
+        );
+        assert!(
+            scan_res
+                .permission_denied_paths
+                .iter()
+                .any(|p| p.contains("restricted")),
             "Restricted directory must be tracked in permission_denied_paths"
         );
         // Normal file was still scanned
-        assert!(scan_res.total_files_scanned >= 1, "Accessible files must still be scanned");
+        assert!(
+            scan_res.total_files_scanned >= 1,
+            "Accessible files must still be scanned"
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_directory_aggregation_and_modification_times() {
-        let temp_dir = std::env::temp_dir().join(format!("spacewise_agg_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("spacewise_agg_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         let folder1 = temp_dir.join("docs");
         let folder2 = temp_dir.join("media");
@@ -925,7 +1014,8 @@ mod tests {
 
     #[test]
     fn test_scan_single_file_target() {
-        let temp_dir = std::env::temp_dir().join(format!("spacewise_single_file_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("spacewise_single_file_test_{}", std::process::id()));
         fs::create_dir_all(&temp_dir).unwrap();
 
         let single_file = temp_dir.join("single_target.bin");
@@ -942,7 +1032,9 @@ mod tests {
 
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let mut scanner = DirectoryScanner::new(options, cancel_flag).unwrap();
-        let result = scanner.scan_multiple_targets::<fn(ScanProgress)>(&[single_file], None).unwrap();
+        let result = scanner
+            .scan_multiple_targets::<fn(ScanProgress)>(&[single_file], None)
+            .unwrap();
 
         assert_eq!(result.total_files_scanned, 1);
         assert_eq!(result.total_bytes_scanned, 5120);
@@ -956,15 +1048,24 @@ mod tests {
 
     #[test]
     fn test_scan_multiple_targets_mixed_and_cancellation() {
-        let temp_dir = std::env::temp_dir().join(format!("spacewise_multi_target_test_{}", std::process::id()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "spacewise_multi_target_test_{}",
+            std::process::id()
+        ));
         fs::create_dir_all(&temp_dir).unwrap();
 
         let folder = temp_dir.join("folder_target");
         fs::create_dir_all(&folder).unwrap();
-        fs::File::create(folder.join("nested.txt")).unwrap().write_all(b"12345").unwrap();
+        fs::File::create(folder.join("nested.txt"))
+            .unwrap()
+            .write_all(b"12345")
+            .unwrap();
 
         let file = temp_dir.join("file_target.txt");
-        fs::File::create(&file).unwrap().write_all(b"67890").unwrap();
+        fs::File::create(&file)
+            .unwrap()
+            .write_all(b"67890")
+            .unwrap();
 
         let options = ScanOptions {
             path: temp_dir.to_string_lossy().to_string(),
@@ -977,7 +1078,9 @@ mod tests {
         // 1. Successful mixed scan
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let mut scanner = DirectoryScanner::new(options.clone(), cancel_flag).unwrap();
-        let result = scanner.scan_multiple_targets::<fn(ScanProgress)>(&[folder.clone(), file.clone()], None).unwrap();
+        let result = scanner
+            .scan_multiple_targets::<fn(ScanProgress)>(&[folder.clone(), file.clone()], None)
+            .unwrap();
 
         assert_eq!(result.total_files_scanned, 2);
         assert_eq!(result.total_bytes_scanned, 10);
@@ -989,6 +1092,38 @@ mod tests {
         let cancel_err = scanner2.scan_multiple_targets::<fn(ScanProgress)>(&[folder, file], None);
         assert!(cancel_err.is_err());
         assert!(cancel_err.unwrap_err().contains("cancelled"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_scanner_permission_denied_bounded_cap() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("spacewise_perm_bound_test_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let options = ScanOptions {
+            path: temp_dir.to_string_lossy().to_string(),
+            max_tree_depth: Some(1),
+            exclude_paths: vec![],
+            same_filesystem: true,
+            large_file_threshold_mb: None,
+        };
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let mut scanner = DirectoryScanner::new(options, cancel_flag).unwrap();
+
+        // Simulate recording 600 permission denied paths
+        for i in 0..600 {
+            scanner.record_permission_denied(format!("/restricted/path/{}", i));
+        }
+
+        assert_eq!(scanner.permission_denied_count, 600);
+        assert_eq!(
+            scanner.permission_denied_paths.len(),
+            MAX_PERMISSION_DENIED_PATHS
+        );
+        assert_eq!(scanner.permission_denied_paths.len(), 500);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

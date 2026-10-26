@@ -50,6 +50,7 @@ export const CleanupView: React.FC<CleanupViewProps> = ({
   );
   const [isModalOpen, setIsModalOpen] = useState<boolean>(false);
   const [cleanupAction, setCleanupAction] = useState<"trash" | "permanent_delete">("trash");
+  const [confirmPermanentDelete, setConfirmPermanentDelete] = useState<boolean>(false);
   const [isCleaning, setIsCleaning] = useState<boolean>(false);
   const [lastExecutionSummary, setLastExecutionSummary] = useState<CleanupExecutionSummary | null>(null);
   const [copiedCommand, setCopiedCommand] = useState<string | null>(null);
@@ -255,6 +256,7 @@ export const CleanupView: React.FC<CleanupViewProps> = ({
             className="btn-primary"
             onClick={() => {
               setExecutionError(null);
+              setConfirmPermanentDelete(false);
               setIsModalOpen(true);
             }}
             disabled={selectedItems.length === 0 || isDemoMode}
@@ -622,7 +624,10 @@ export const CleanupView: React.FC<CleanupViewProps> = ({
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
                   <button
                     type="button"
-                    onClick={() => setCleanupAction("trash")}
+                    onClick={() => {
+                      setCleanupAction("trash");
+                      setConfirmPermanentDelete(false);
+                    }}
                     className={cleanupAction === "trash" ? "btn-primary" : "btn-secondary"}
                     style={{
                       display: "flex",
@@ -639,7 +644,10 @@ export const CleanupView: React.FC<CleanupViewProps> = ({
 
                   <button
                     type="button"
-                    onClick={() => setCleanupAction("permanent_delete")}
+                    onClick={() => {
+                      setCleanupAction("permanent_delete");
+                      setConfirmPermanentDelete(false);
+                    }}
                     className={cleanupAction === "permanent_delete" ? "btn-danger" : "btn-secondary"}
                     style={{
                       display: "flex",
@@ -691,6 +699,35 @@ export const CleanupView: React.FC<CleanupViewProps> = ({
                   </div>
                 )}
               </div>
+
+              {/* Explicit Permanent Deletion Intent Confirmation */}
+              {cleanupAction === "permanent_delete" && (
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "flex-start",
+                    gap: "10px",
+                    background: "rgba(239, 68, 68, 0.08)",
+                    border: "1px solid rgba(239, 68, 68, 0.3)",
+                    borderRadius: "var(--radius-sm)",
+                    padding: "10px 14px",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    id="confirm-permanent-delete-checkbox"
+                    checked={confirmPermanentDelete}
+                    onChange={(e) => setConfirmPermanentDelete(e.target.checked)}
+                    style={{ marginTop: "2px", accentColor: "var(--status-danger)", cursor: "pointer" }}
+                  />
+                  <label
+                    htmlFor="confirm-permanent-delete-checkbox"
+                    style={{ fontSize: "12px", color: "var(--text-primary)", cursor: "pointer", lineHeight: "1.4" }}
+                  >
+                    I understand that permanent deletion cannot be undone and these files will be permanently erased from disk immediately.
+                  </label>
+                </div>
+              )}
 
               {/* Exact Targets Confirmation List */}
               <div>
@@ -773,7 +810,7 @@ export const CleanupView: React.FC<CleanupViewProps> = ({
                   await handleExecuteCleanup();
                   setIsModalOpen(false);
                 }}
-                disabled={isCleaning}
+                disabled={isCleaning || (cleanupAction === "permanent_delete" && !confirmPermanentDelete)}
               >
                 {cleanupAction === "permanent_delete" ? <Trash2 size={15} /> : <Archive size={15} />}
                 <span>

@@ -1,11 +1,11 @@
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 
 use crate::cleanup::{
-    compute_exact_dir_size, remove_dir_contents_recursive, FreeDesktopTrash,
-    PROTECTED_SYSTEM_PATHS, PROTECTED_USER_SUBPATHS,
+    FreeDesktopTrash, PROTECTED_SYSTEM_PATHS, PROTECTED_USER_SUBPATHS, compute_exact_dir_size,
+    get_validated_home_dir, remove_dir_contents_recursive,
 };
 use crate::models::CleanupExecutionSummary;
 use crate::scanner::{classify_file, format_epoch_date};
@@ -83,9 +83,7 @@ pub struct SelectiveCleanupRequest {
 
 /// Retrieves the current user's home directory safely
 pub fn get_user_home() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/"))
+    get_validated_home_dir().unwrap_or_else(|_| PathBuf::from("/"))
 }
 
 /// Lists directory contents safely with pagination, sorting, and symlink protection
@@ -109,7 +107,10 @@ pub fn list_directory_contents(
     let canonical = match target_path.canonicalize() {
         Ok(c) => c,
         Err(e) => {
-            return Err(format!("Directory path does not exist or cannot be accessed: {}", e));
+            return Err(format!(
+                "Directory path does not exist or cannot be accessed: {}",
+                e
+            ));
         }
     };
 
@@ -128,7 +129,10 @@ pub fn list_directory_contents(
         Err(e) => {
             let is_perm = e.kind() == std::io::ErrorKind::PermissionDenied;
             let msg = if is_perm {
-                format!("Permission denied: You do not have permission to read '{}'.", canonical_str)
+                format!(
+                    "Permission denied: You do not have permission to read '{}'.",
+                    canonical_str
+                )
             } else {
                 format!("Failed to open directory: {}", e)
             };
@@ -195,11 +199,7 @@ pub fn list_directory_contents(
             sym_meta.is_dir()
         };
 
-        let size_bytes = if is_dir {
-            0
-        } else {
-            sym_meta.len()
-        };
+        let size_bytes = if is_dir { 0 } else { sym_meta.len() };
 
         if is_dir {
             total_dirs += 1;
@@ -254,12 +254,10 @@ pub fn list_directory_contents(
     }
 
     // Default sorting: directories first (alphabetical case-insensitive), then files (alphabetical case-insensitive)
-    items.sort_by(|a, b| {
-        match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        }
+    items.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
 
     let total_count = items.len();
@@ -299,6 +297,122 @@ pub fn list_directory_contents(
     })
 }
 
+/// Validates that a path is safe for selective cleanup operations with an explicit home root
+pub fn validate_selective_path_with_home(
+    path: &Path,
+    home_canonical: &Path,
+) -> Result<PathBuf, String> {
+    let path_str = path.to_string_lossy();
+
+    // 1. Reject empty
+    if path_str.trim().is_empty() {
+        return Err("Selective path cannot be empty".to_string());
+    }
+
+    // 2. Reject relative paths
+    if !path.is_absolute() {
+        return Err("Relative paths are strictly prohibited for selective cleanup".to_string());
+    }
+
+    // 3. Reject path traversal
+    if path_str.contains("..") {
+        return Err("Path traversal (..) is strictly rejected".to_string());
+    }
+
+    // 4. Reject symlinks: symlinks cannot be target of deletion to prevent deleting target content unexpectedly
+    let orig_meta = fs::symlink_metadata(path)
+        .map_err(|e| format!("Failed to read metadata for {}: {}", path.display(), e))?;
+
+    if orig_meta.file_type().is_symlink() {
+        return Err(
+            "Symbolic links cannot be the target of cleanup operations to protect linked targets"
+                .to_string(),
+        );
+    }
+
+    // 5. Canonicalize
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("Failed to canonicalize path {}: {}", path.display(), e))?;
+
+    let canonical_str = canonical.to_string_lossy();
+
+    // 6. Reject protected system paths
+    if canonical_str == "/" {
+        return Err("Protected system root cannot be cleaned: /".to_string());
+    }
+    for &sys_path in PROTECTED_SYSTEM_PATHS {
+        if canonical_str == sys_path {
+            return Err(format!(
+                "Protected system root cannot be cleaned: {}",
+                sys_path
+            ));
+        }
+    }
+
+    // 7. Verify not symlink after canonicalization
+    let canonical_meta = fs::symlink_metadata(&canonical)
+        .map_err(|e| format!("Failed to read metadata for {}: {}", canonical.display(), e))?;
+
+    if canonical_meta.file_type().is_symlink() {
+        return Err(
+            "Symbolic links cannot be the target of cleanup operations to protect linked targets"
+                .to_string(),
+        );
+    }
+
+    // 8. User home root check
+    if canonical == *home_canonical {
+        return Err("User home root cannot be cleaned directly".to_string());
+    }
+
+    // 9. Check protected user subpaths (.config, .ssh, etc.)
+    for &sub in PROTECTED_USER_SUBPATHS {
+        let protected = home_canonical.join(sub);
+        if canonical == protected || canonical.starts_with(&protected) {
+            return Err(format!(
+                "Protected user configuration path cannot be cleaned: {}",
+                sub
+            ));
+        }
+    }
+
+    // 10. Prevent deleting critical top-level folders directly
+    let local_share = home_canonical.join(".local/share");
+    if canonical == local_share || canonical == home_canonical.join(".local") {
+        return Err("Protected user data root cannot be cleaned directly".to_string());
+    }
+
+    // 11. Must be in user home or user-owned /tmp
+    let tmp_root = PathBuf::from("/tmp");
+    let is_in_home = canonical.starts_with(home_canonical);
+    let is_in_tmp = !is_in_home && canonical.starts_with(&tmp_root) && canonical != tmp_root;
+
+    if is_in_tmp {
+        let euid = unsafe { libc::geteuid() };
+        if orig_meta.uid() != euid || canonical_meta.uid() != euid {
+            return Err(format!(
+                "Refusing to target file in /tmp not owned by current user (UID {})",
+                euid
+            ));
+        }
+        let mode = canonical_meta.mode();
+        let file_type_bits = mode & libc::S_IFMT;
+        if file_type_bits == libc::S_IFSOCK || file_type_bits == libc::S_IFIFO {
+            return Err("Special files (sockets/FIFOs) in /tmp cannot be cleaned".to_string());
+        }
+    }
+
+    if !is_in_home && !is_in_tmp {
+        return Err(format!(
+            "Path is outside permitted user home and /tmp boundaries: {}",
+            canonical.display()
+        ));
+    }
+
+    Ok(canonical)
+}
+
 /// Validates that a path is safe for selective cleanup operations
 pub fn validate_selective_path(path: &Path) -> Result<PathBuf, String> {
     // 1. Root check
@@ -308,67 +422,8 @@ pub fn validate_selective_path(path: &Path) -> Result<PathBuf, String> {
         }
     }
 
-    let path_str = path.to_string_lossy();
-
-    // 2. Reject path traversal
-    if path_str.contains("..") {
-        return Err("Path traversal (..) is strictly rejected".to_string());
-    }
-
-    // 3. Reject symlinks: symlinks cannot be target of deletion to prevent deleting target content unexpectedly
-    let orig_meta = fs::symlink_metadata(path)
-        .map_err(|e| format!("Failed to read metadata for {}: {}", path.display(), e))?;
-
-    if orig_meta.file_type().is_symlink() {
-        return Err("Symbolic links cannot be the target of cleanup operations to protect linked targets".to_string());
-    }
-
-    // 4. Canonicalize
-    let canonical = path
-        .canonicalize()
-        .map_err(|e| format!("Failed to canonicalize path {}: {}", path.display(), e))?;
-
-    let canonical_str = canonical.to_string_lossy();
-
-    // 5. Reject protected system paths
-    for &sys_path in PROTECTED_SYSTEM_PATHS {
-        if canonical_str == sys_path {
-            return Err(format!("Protected system root cannot be cleaned: {}", sys_path));
-        }
-    }
-
-    let home = std::env::var("HOME").unwrap_or_default();
-    if !home.is_empty() {
-        let home_canonical = PathBuf::from(&home).canonicalize().unwrap_or_else(|_| PathBuf::from(&home));
-        if canonical == home_canonical {
-            return Err("User home root cannot be cleaned directly".to_string());
-        }
-
-        // 6. Check protected user subpaths (.config, .ssh, etc.)
-        for &sub in PROTECTED_USER_SUBPATHS {
-            let protected = home_canonical.join(sub);
-            if canonical == protected || canonical.starts_with(&protected) {
-                return Err(format!("Protected user configuration path cannot be cleaned: {}", sub));
-            }
-        }
-
-        // 7. Prevent deleting critical top-level folders directly
-        let local_share = home_canonical.join(".local/share");
-        if canonical == local_share || canonical == home_canonical.join(".local") {
-            return Err("Protected user data root cannot be cleaned directly".to_string());
-        }
-
-        // Must be in user home or /tmp
-        let tmp_root = PathBuf::from("/tmp");
-        let is_in_home = canonical.starts_with(&home_canonical);
-        let is_in_tmp = canonical.starts_with(&tmp_root);
-
-        if !is_in_home && !is_in_tmp {
-            return Err(format!("Path is outside permitted user home and /tmp boundaries: {}", canonical.display()));
-        }
-    }
-
-    Ok(canonical)
+    let home = get_validated_home_dir()?;
+    validate_selective_path_with_home(path, &home)
 }
 
 /// Generates a preview for selective cleanup targets without modifying anything
@@ -383,7 +438,11 @@ pub fn preview_selective_cleanup_targets(
 
     for path_str in paths {
         let path = PathBuf::from(path_str);
-        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or(path_str).to_string();
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(path_str)
+            .to_string();
 
         let sym_meta = fs::symlink_metadata(&path);
         let (is_dir, is_symlink) = match sym_meta {
@@ -402,7 +461,10 @@ pub fn preview_selective_cleanup_targets(
                 };
 
                 let warning = if is_dir && file_count > 100 {
-                    Some(format!("Directory contains {} items. Double-check before executing.", file_count))
+                    Some(format!(
+                        "Directory contains {} items. Double-check before executing.",
+                        file_count
+                    ))
                 } else {
                     None
                 };
@@ -463,6 +525,13 @@ pub fn execute_selective_cleanup_targets(
         if libc::geteuid() == 0 {
             return Err("Spacewise must not be executed with root/sudo privileges".to_string());
         }
+    }
+
+    if request.action != "trash" && request.action != "permanent_delete" {
+        return Err(format!(
+            "Unknown or invalid selective cleanup action '{}'. Allowed actions are 'trash' and 'permanent_delete'",
+            request.action
+        ));
     }
 
     let trash = match trash_override {
@@ -532,9 +601,14 @@ pub fn execute_selective_cleanup_targets(
                 Ok((b, f)) => (b, f, None),
                 Err(e) => (0, 0, Some(format!("Failed to move to Trash: {}", e))),
             }
-        } else if request.action == "permanent_delete" || (request.action == "trash" && is_trash_root) {
+        } else if request.action == "permanent_delete"
+            || (request.action == "trash" && is_trash_root)
+        {
             if is_trash_root {
-                let file_name = validated_path.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+                let file_name = validated_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default();
                 match trash.delete_permanently(file_name) {
                     Ok((b, f)) => (b, f, None),
                     Err(e) => (0, 0, Some(format!("Failed to delete from trash: {}", e))),
@@ -544,12 +618,23 @@ pub fn execute_selective_cleanup_targets(
                     Ok((b, f)) => {
                         // After contents removed, remove the empty directory itself
                         if let Err(e) = fs::remove_dir(&validated_path) {
-                            (b, f, Some(format!("Removed contents but failed to remove directory itself: {}", e)))
+                            (
+                                b,
+                                f,
+                                Some(format!(
+                                    "Removed contents but failed to remove directory itself: {}",
+                                    e
+                                )),
+                            )
                         } else {
                             (b, f + 1, None)
                         }
                     }
-                    Err(e) => (0, 0, Some(format!("Failed to remove directory contents: {}", e))),
+                    Err(e) => (
+                        0,
+                        0,
+                        Some(format!("Failed to remove directory contents: {}", e)),
+                    ),
                 }
             } else {
                 let len = meta.len();
@@ -603,7 +688,9 @@ pub fn reveal_path_in_file_manager(path_str: &str) -> Result<(), String> {
         return Err("File or folder does not exist".to_string());
     }
 
-    let canonical = p.canonicalize().map_err(|e| format!("Failed to canonicalize path: {}", e))?;
+    let canonical = p
+        .canonicalize()
+        .map_err(|e| format!("Failed to canonicalize path: {}", e))?;
 
     // If it's a file, open its parent directory so the user sees the file in its containing folder
     let target_to_open = if canonical.is_file() {
@@ -630,7 +717,13 @@ mod tests {
 
     #[test]
     fn test_list_directory_navigation_and_metadata() {
-        let temp_dir = std::env::temp_dir().join(format!("sw_test_nav_{}", std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sw_test_nav_{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         fs::create_dir_all(&temp_dir).unwrap();
 
         let sub_dir = temp_dir.join("subfolder");
@@ -662,7 +755,13 @@ mod tests {
 
     #[test]
     fn test_list_directory_empty_folder() {
-        let temp_dir = std::env::temp_dir().join(format!("sw_test_empty_{}", std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sw_test_empty_{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         fs::create_dir_all(&temp_dir).unwrap();
 
         let result = list_directory_contents(temp_dir.to_str().unwrap(), 1, 50, true).unwrap();
@@ -676,7 +775,13 @@ mod tests {
 
     #[test]
     fn test_list_directory_sorting() {
-        let temp_dir = std::env::temp_dir().join(format!("sw_test_sort_{}", std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sw_test_sort_{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         fs::create_dir_all(&temp_dir).unwrap();
 
         fs::create_dir_all(temp_dir.join("z_folder")).unwrap();
@@ -704,7 +809,13 @@ mod tests {
 
     #[test]
     fn test_list_directory_symlink_not_followed() {
-        let temp_dir = std::env::temp_dir().join(format!("sw_test_sym_{}", std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sw_test_sym_{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         fs::create_dir_all(&temp_dir).unwrap();
 
         let target_dir = temp_dir.join("real_folder");
@@ -715,7 +826,11 @@ mod tests {
         symlink(&target_dir, &link_path).unwrap();
 
         let result = list_directory_contents(temp_dir.to_str().unwrap(), 1, 50, true).unwrap();
-        let sym_item = result.items.iter().find(|i| i.name == "symlink_to_folder").unwrap();
+        let sym_item = result
+            .items
+            .iter()
+            .find(|i| i.name == "symlink_to_folder")
+            .unwrap();
 
         assert!(sym_item.is_symlink);
         assert!(!sym_item.is_dir); // Treated as link, not directory
@@ -733,7 +848,13 @@ mod tests {
 
     #[test]
     fn test_selective_cleanup_preview_eligible_and_ineligible() {
-        let temp_dir = std::env::temp_dir().join(format!("sw_test_clean_prev_{}", std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sw_test_clean_prev_{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         fs::create_dir_all(&temp_dir).unwrap();
 
         let file = temp_dir.join("deleteme.tmp");
@@ -744,7 +865,8 @@ mod tests {
         let preview = preview_selective_cleanup_targets(&[
             file.to_str().unwrap().to_string(),
             "/etc/passwd".to_string(),
-        ]).unwrap();
+        ])
+        .unwrap();
 
         assert_eq!(preview.total_targets, 2);
         assert_eq!(preview.eligible_count, 1);
@@ -761,15 +883,27 @@ mod tests {
 
     #[test]
     fn test_selective_cleanup_trash_and_permanent_delete() {
-        let temp_dir = std::env::temp_dir().join(format!("sw_test_clean_exec_{}", std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sw_test_clean_exec_{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let trash_dir = temp_dir.join("Trash");
         fs::create_dir_all(&trash_dir).unwrap();
 
         let file_for_trash = temp_dir.join("trashme.txt");
-        fs::File::create(&file_for_trash).unwrap().write_all(b"trash-content").unwrap();
+        fs::File::create(&file_for_trash)
+            .unwrap()
+            .write_all(b"trash-content")
+            .unwrap();
 
         let file_for_delete = temp_dir.join("deleteme.txt");
-        fs::File::create(&file_for_delete).unwrap().write_all(b"permanent-content").unwrap();
+        fs::File::create(&file_for_delete)
+            .unwrap()
+            .write_all(b"permanent-content")
+            .unwrap();
 
         // 1. Move to trash
         let trash_req = SelectiveCleanupRequest {
@@ -790,6 +924,68 @@ mod tests {
         assert_eq!(del_res.success_count, 1);
         assert_eq!(del_res.failure_count, 0);
         assert!(!file_for_delete.exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_selective_cleanup_unknown_action_rejected() {
+        let invalid_actions = vec!["", "clean", "delete", "destroy", "trash "];
+        for action in invalid_actions {
+            let req = SelectiveCleanupRequest {
+                paths: vec!["/tmp/dummy".to_string()],
+                action: action.to_string(),
+            };
+            let res = execute_selective_cleanup_targets(req, None);
+            assert!(res.is_err(), "Action '{}' must be rejected", action);
+            assert!(
+                res.unwrap_err()
+                    .contains("Unknown or invalid selective cleanup action")
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_selective_path_boundaries() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sw_test_sel_bound_{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let fake_home = temp_dir.join("home");
+        fs::create_dir_all(&fake_home).unwrap();
+        let fake_home_canonical = fake_home.canonicalize().unwrap();
+
+        // Empty path rejected
+        assert!(validate_selective_path_with_home(Path::new(""), &fake_home_canonical).is_err());
+
+        // Relative path rejected
+        assert!(
+            validate_selective_path_with_home(Path::new("file.txt"), &fake_home_canonical).is_err()
+        );
+
+        // Path traversal rejected
+        assert!(
+            validate_selective_path_with_home(
+                Path::new("/tmp/../etc/passwd"),
+                &fake_home_canonical
+            )
+            .is_err()
+        );
+
+        // Home root rejected
+        assert!(
+            validate_selective_path_with_home(&fake_home_canonical, &fake_home_canonical).is_err()
+        );
+
+        // Protected subpaths rejected
+        let ssh_dir = fake_home_canonical.join(".ssh");
+        fs::create_dir_all(&ssh_dir).unwrap();
+        assert!(validate_selective_path_with_home(&ssh_dir, &fake_home_canonical).is_err());
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

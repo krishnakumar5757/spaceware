@@ -6,9 +6,9 @@ pub mod models;
 pub mod scanner;
 
 use commands::{
-    cancel_scan, execute_cleanup, execute_selective_cleanup, get_cleanup_candidates,
+    ScannerState, cancel_scan, execute_cleanup, execute_selective_cleanup, get_cleanup_candidates,
     get_home_directory, get_mounts, get_scan_status, get_storage_summary, list_directory,
-    preview_selective_cleanup, reveal_in_file_manager, scan_targets, start_scan, ScannerState,
+    preview_selective_cleanup, reveal_in_file_manager, scan_targets, start_scan,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
