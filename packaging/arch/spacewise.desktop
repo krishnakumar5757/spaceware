@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Spacewise
+GenericName=Disk Storage Analyzer
+Comment=Modern disk usage analyzer and selective cleanup desktop utility
+Exec=spacewise
+Icon=spacewise
+Terminal=false
+Type=Application
+StartupWMClass=spacewise
+Categories=System;Filesystem;
+Keywords=disk;storage;cleanup;analyzer;space;usage;
