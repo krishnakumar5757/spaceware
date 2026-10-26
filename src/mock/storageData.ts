@@ -6,7 +6,30 @@ import {
   DirectoryNode,
 } from "../types/storage";
 
-// Storage Summary Mock Data for CachyOS / Linux Desktop
+// Empty baseline Storage Summary before filesystem is probed
+export const emptyStorageSummary: StorageSummary = {
+  driveName: "Detecting storage...",
+  mountPoint: "/",
+  filesystem: "Detecting...",
+  totalBytes: 0,
+  usedBytes: 0,
+  freeBytes: 0,
+  availableBytes: 0,
+  reclaimableBytes: 0,
+  lastScanned: "Not scanned yet",
+  isLiveData: false,
+};
+
+export const emptyDirectoryTree: DirectoryNode = {
+  id: "root",
+  name: "Root",
+  path: "/",
+  sizeBytes: 0,
+  type: "folder",
+  children: [],
+};
+
+// Storage Summary Mock Data for CachyOS / Linux Desktop (Explicit Demo Preview only)
 export const mockStorageSummary: StorageSummary = {
   driveName: "Samsung 990 PRO NVMe SSD",
   mountPoint: "/home",
@@ -14,8 +37,10 @@ export const mockStorageSummary: StorageSummary = {
   totalBytes: 1000 * 1024 * 1024 * 1024, // 1000 GB (~931.3 GiB)
   usedBytes: 712.4 * 1024 * 1024 * 1024, // 712.4 GB
   freeBytes: 287.6 * 1024 * 1024 * 1024, // 287.6 GB
+  availableBytes: 287.6 * 1024 * 1024 * 1024,
   reclaimableBytes: 52.8 * 1024 * 1024 * 1024, // 52.8 GB
   lastScanned: "Today, 14:15",
+  isLiveData: false,
 };
 
 // Storage Categories with distinct harmonious colors

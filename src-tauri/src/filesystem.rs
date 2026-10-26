@@ -194,7 +194,7 @@ pub fn get_storage_summary_for_path(path: &Path) -> Result<StorageSummary, Strin
     let mounts = get_mounted_filesystems().unwrap_or_default();
     let mount_info = find_mount_for_path(path, &mounts);
 
-    let (total, used, free, _) = statvfs_path(path)?;
+    let (total, used, free, avail) = statvfs_path(path)?;
 
     let (drive_name, mount_point, fs_type) = if let Some(m) = mount_info {
         (m.device, m.mount_point, m.fs_type)
@@ -216,6 +216,7 @@ pub fn get_storage_summary_for_path(path: &Path) -> Result<StorageSummary, Strin
         total_bytes: total,
         used_bytes: used,
         free_bytes: free,
+        available_bytes: avail,
         reclaimable_bytes: 0, // Computed by scanner
         last_scanned: time_str,
         is_live_data: true,
@@ -273,5 +274,16 @@ mod tests {
         assert!(!is_physical_or_storage_fs("proc", "proc", "/proc"));
         assert!(!is_physical_or_storage_fs("sysfs", "sysfs", "/sys"));
         assert!(!is_physical_or_storage_fs("cgroup2", "cgroup2", "/sys/fs/cgroup"));
+    }
+
+    #[test]
+    fn test_get_storage_summary_for_path() {
+        let temp = std::env::temp_dir();
+        let summary = get_storage_summary_for_path(&temp);
+        assert!(summary.is_ok(), "storage summary should succeed for temp dir");
+        let s = summary.unwrap();
+        assert!(s.total_bytes > 0);
+        assert!(s.available_bytes <= s.total_bytes);
+        assert!(s.is_live_data);
     }
 }

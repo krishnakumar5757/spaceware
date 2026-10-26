@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import {
+  CleanupExecutionSummary,
+  CleanupRecommendation,
   MountedFilesystem,
   ScanOptions,
   ScanProgress,
@@ -27,26 +29,7 @@ export function isTauriEnvironment(): boolean {
  */
 export async function getMountedFilesystems(): Promise<MountedFilesystem[]> {
   if (!isTauriEnvironment()) {
-    return [
-      {
-        device: "/dev/nvme0n1p8",
-        mountPoint: "/home",
-        fsType: "btrfs",
-        totalBytes: 1000 * 1024 * 1024 * 1024,
-        usedBytes: 712.4 * 1024 * 1024 * 1024,
-        freeBytes: 287.6 * 1024 * 1024 * 1024,
-        availableBytes: 287.6 * 1024 * 1024 * 1024,
-      },
-      {
-        device: "/dev/nvme0n1p2",
-        mountPoint: "/",
-        fsType: "ext4",
-        totalBytes: 120 * 1024 * 1024 * 1024,
-        usedBytes: 84.2 * 1024 * 1024 * 1024,
-        freeBytes: 35.8 * 1024 * 1024 * 1024,
-        availableBytes: 35.8 * 1024 * 1024 * 1024,
-      },
-    ];
+    throw new Error("Desktop backend unavailable: Tauri environment not detected.");
   }
 
   try {
@@ -59,17 +42,18 @@ export async function getMountedFilesystems(): Promise<MountedFilesystem[]> {
 
 /**
  * Retrieve exact filesystem capacity summary for a given path.
+ * Never falls back to hardcoded mock data.
  */
 export async function getStorageSummary(path?: string): Promise<StorageSummary> {
   if (!isTauriEnvironment()) {
-    return { ...mockStorageSummary, isLiveData: false };
+    throw new Error("Desktop backend unavailable: Tauri environment not detected.");
   }
 
   try {
     return await invoke<StorageSummary>("get_storage_summary", { path });
   } catch (err) {
-    console.warn("Failed to get real storage summary, falling back:", err);
-    return { ...mockStorageSummary, isLiveData: false };
+    console.error("Failed to invoke get_storage_summary:", err);
+    throw err;
   }
 }
 
@@ -78,23 +62,7 @@ export async function getStorageSummary(path?: string): Promise<StorageSummary> 
  */
 export async function startDirectoryScan(options?: ScanOptions): Promise<ScanResult> {
   if (!isTauriEnvironment()) {
-    // Simulated fallback result when tested outside desktop shell
-    await new Promise((res) => setTimeout(res, 1800));
-    return {
-      rootPath: options?.path || "/home/krishna",
-      summary: { ...mockStorageSummary, isLiveData: false },
-      categories: mockCategories,
-      largestFiles: mockLargestFiles,
-      recommendations: mockRecommendations,
-      directoryTree: mockDirectoryTree,
-      totalFilesScanned: 682000,
-      totalDirsScanned: 42000,
-      totalBytesScanned: 712.4 * 1024 * 1024 * 1024,
-      permissionDeniedCount: 0,
-      permissionDeniedPaths: [],
-      scanDurationMs: 1820,
-      isLiveData: false,
-    };
+    throw new Error("Native filesystem crawler requires Tauri desktop environment.");
   }
 
   return await invoke<ScanResult>("start_scan", { options });
@@ -133,4 +101,141 @@ export async function subscribeScanProgress(
   return await listen<ScanProgress>("scan-progress", (event) => {
     onProgress(event.payload);
   });
+}
+
+/**
+ * Retrieve discovered real cleanup candidates from Linux filesystem.
+ */
+export async function getCleanupCandidates(): Promise<CleanupRecommendation[]> {
+  if (!isTauriEnvironment()) {
+    return [];
+  }
+
+  try {
+    return await invoke<CleanupRecommendation[]>("get_cleanup_candidates");
+  } catch (err) {
+    console.error("Failed to invoke get_cleanup_candidates:", err);
+    throw err;
+  }
+}
+
+/**
+ * Execute validated cleanup (Move to Trash or Permanent Deletion).
+ */
+export async function executeCleanup(
+  candidateIds: string[],
+  action: "trash" | "permanent_delete" = "trash"
+): Promise<CleanupExecutionSummary> {
+  if (!isTauriEnvironment()) {
+    throw new Error("Cleanup execution requires Tauri desktop environment.");
+  }
+
+  return await invoke<CleanupExecutionSummary>("execute_cleanup", {
+    request: {
+      candidateIds,
+      action,
+    },
+  });
+}
+
+/**
+ * Retrieve user's home directory.
+ */
+export async function getHomeDirectory(): Promise<string> {
+  if (!isTauriEnvironment()) {
+    return "/home/user";
+  }
+  return await invoke<string>("get_home_directory");
+}
+
+/**
+ * List contents of directory safely with pagination, sorting, and symlink protection.
+ */
+export async function listDirectory(
+  path?: string,
+  page: number = 1,
+  pageSize: number = 500,
+  showHidden: boolean = false
+): Promise<import("../types/storage").DirectoryListingResult> {
+  if (!isTauriEnvironment()) {
+    throw new Error("Native filesystem explorer requires Tauri desktop environment.");
+  }
+
+  return await invoke<import("../types/storage").DirectoryListingResult>("list_directory", {
+    path: path || null,
+    page,
+    pageSize,
+    showHidden,
+  });
+}
+
+/**
+ * Scan specific selected targets (files or directories).
+ */
+export async function scanTargets(targets: string[]): Promise<ScanResult> {
+  if (!isTauriEnvironment()) {
+    throw new Error("Native filesystem crawler requires Tauri desktop environment.");
+  }
+
+  return await invoke<ScanResult>("scan_targets", { targets });
+}
+
+/**
+ * Reveal a file or directory in the system's native desktop file manager.
+ */
+export async function revealInFileManager(path: string): Promise<void> {
+  if (!isTauriEnvironment()) {
+    console.info("Reveal in file manager simulated for:", path);
+    return;
+  }
+
+  return await invoke<void>("reveal_in_file_manager", { path });
+}
+
+/**
+ * Preview selective cleanup for a set of target paths.
+ */
+export async function previewSelectiveCleanup(
+  paths: string[]
+): Promise<import("../types/storage").SelectiveCleanupPreview> {
+  if (!isTauriEnvironment()) {
+    throw new Error("Cleanup preview requires Tauri desktop environment.");
+  }
+
+  return await invoke<import("../types/storage").SelectiveCleanupPreview>("preview_selective_cleanup", {
+    paths,
+  });
+}
+
+/**
+ * Execute selective cleanup on specific user-chosen targets.
+ */
+export async function executeSelectiveCleanup(
+  paths: string[],
+  action: "trash" | "permanent_delete" = "trash"
+): Promise<CleanupExecutionSummary> {
+  if (!isTauriEnvironment()) {
+    throw new Error("Cleanup execution requires Tauri desktop environment.");
+  }
+
+  return await invoke<CleanupExecutionSummary>("execute_selective_cleanup", {
+    request: {
+      paths,
+      action,
+    },
+  });
+}
+
+/**
+ * Explicit opt-in development fixture loader.
+ * Kept strictly for preview or testing, never called automatically on startup.
+ */
+export function loadDemoFixtures() {
+  return {
+    summary: { ...mockStorageSummary, isLiveData: false },
+    categories: mockCategories,
+    largestFiles: mockLargestFiles,
+    recommendations: mockRecommendations,
+    directoryTree: mockDirectoryTree,
+  };
 }

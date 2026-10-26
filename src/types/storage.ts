@@ -10,6 +10,15 @@ export interface MountedFilesystem {
   availableBytes: number;
 }
 
+export type AppScanState =
+  | "initializing"
+  | "ready"
+  | "scanning"
+  | "completed"
+  | "completed_with_errors"
+  | "failed"
+  | "no_filesystem";
+
 export interface StorageSummary {
   driveName: string;
   mountPoint: string;
@@ -17,6 +26,7 @@ export interface StorageSummary {
   totalBytes: number;
   usedBytes: number;
   freeBytes: number;
+  availableBytes?: number;
   reclaimableBytes: number;
   lastScanned: string;
   isLiveData?: boolean;
@@ -48,13 +58,38 @@ export interface FileItem {
 export interface CleanupRecommendation {
   id: string;
   title: string;
-  category: "cache" | "developer" | "logs" | "trash" | "old_files" | string;
+  category: "cache" | "developer" | "logs" | "trash" | "package_cache" | "old_files" | string;
   description: string;
   reclaimableBytes: number;
   fileCount: number;
   riskLevel: "safe" | "caution" | "manual_review" | string;
   path: string;
   checked?: boolean;
+  reason?: string;
+  actionType?: "trash" | "permanent_delete" | "manual_instruction" | string;
+  manualCommand?: string;
+}
+
+export interface CleanupActionRequest {
+  candidateIds: string[];
+  action: "trash" | "permanent_delete";
+}
+
+export interface CleanupItemResult {
+  id: string;
+  path: string;
+  success: boolean;
+  bytesFreed: number;
+  filesRemoved: number;
+  error?: string;
+}
+
+export interface CleanupExecutionSummary {
+  totalBytesFreed: number;
+  totalFilesRemoved: number;
+  itemResults: CleanupItemResult[];
+  successCount: number;
+  failureCount: number;
 }
 
 export interface ScanStatus {
@@ -64,6 +99,8 @@ export interface ScanStatus {
   filesScannedCount: number;
   lastCompleted: string;
   isLiveData?: boolean;
+  state?: AppScanState;
+  errorMessage?: string | null;
 }
 
 export interface DirectoryNode {
@@ -107,4 +144,65 @@ export interface ScanResult {
   permissionDeniedPaths: string[];
   scanDurationMs: number;
   isLiveData: boolean;
+}
+
+export interface ExplorerItem {
+  id: string;
+  name: string;
+  path: string;
+  sizeBytes: number;
+  isDir: boolean;
+  isSymlink: boolean;
+  symlinkTarget?: string | null;
+  extension: string;
+  fileType: string;
+  category: string;
+  lastModified: string;
+  lastModifiedEpoch: number;
+  isHidden: boolean;
+  isReadonly: boolean;
+}
+
+export interface DirectoryListingResult {
+  currentPath: string;
+  parentPath?: string | null;
+  canonicalPath: string;
+  items: ExplorerItem[];
+  totalCount: number;
+  totalDirs: number;
+  totalFiles: number;
+  totalBytes: number;
+  isReadable: boolean;
+  errorMessage?: string | null;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  hasMore: boolean;
+}
+
+export interface SelectiveCleanupTargetPreview {
+  path: string;
+  name: string;
+  isDir: boolean;
+  isSymlink: boolean;
+  sizeBytes: number;
+  fileCount: number;
+  isEligible: boolean;
+  ineligibilityReason?: string | null;
+  warning?: string | null;
+}
+
+export interface SelectiveCleanupPreview {
+  targets: SelectiveCleanupTargetPreview[];
+  totalEligibleBytes: number;
+  totalEligibleFiles: number;
+  totalTargets: number;
+  eligibleCount: number;
+  ineligibleCount: number;
+  recommendedAction: string;
+}
+
+export interface SelectiveCleanupRequest {
+  paths: string[];
+  action: "trash" | "permanent_delete";
 }

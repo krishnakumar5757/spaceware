@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import {
   Sparkles,
   ShieldCheck,
@@ -9,71 +9,183 @@ import {
   CheckCircle2,
   X,
   RefreshCw,
+  Terminal,
+  Copy,
+  Check,
+  Info,
+  Archive,
 } from "lucide-react";
-import { CleanupRecommendation } from "../../types/storage";
-import { mockRecommendations, formatBytes, formatNumber } from "../../mock/storageData";
+import {
+  CleanupRecommendation,
+  CleanupExecutionSummary,
+} from "../../types/storage";
+import {
+  formatBytes,
+  formatNumber,
+} from "../../mock/storageData";
 import { useScrollRevealContainer } from "../../hooks/useScrollReveal";
+import {
+  executeCleanup,
+} from "../../services/scannerService";
 
 interface CleanupViewProps {
   recommendations?: CleanupRecommendation[];
+  isDemoMode?: boolean;
+  hasCompletedScan?: boolean;
+  onTriggerScan?: () => void;
+  onCleanupExecuted?: (summary: CleanupExecutionSummary) => void;
 }
 
-export const CleanupView: React.FC<CleanupViewProps> = ({ recommendations }) => {
+export const CleanupView: React.FC<CleanupViewProps> = ({
+  recommendations,
+  isDemoMode = false,
+  hasCompletedScan = false,
+  onTriggerScan,
+  onCleanupExecuted,
+}) => {
   const containerRef = useScrollRevealContainer<HTMLDivElement>();
 
   const [items, setItems] = useState<CleanupRecommendation[]>(
-    recommendations || mockRecommendations
+    recommendations || []
   );
   const [isModalOpen, setIsModalOpen] = useState<boolean>(false);
+  const [cleanupAction, setCleanupAction] = useState<"trash" | "permanent_delete">("trash");
   const [isCleaning, setIsCleaning] = useState<boolean>(false);
-  const [cleanedSuccess, setCleanedSuccess] = useState<boolean>(false);
-  const [lastFreedAmount, setLastFreedAmount] = useState<number>(0);
+  const [lastExecutionSummary, setLastExecutionSummary] = useState<CleanupExecutionSummary | null>(null);
+  const [copiedCommand, setCopiedCommand] = useState<string | null>(null);
+  const [executionError, setExecutionError] = useState<string | null>(null);
 
-  // Sync when real scanner recommendations update
-  React.useEffect(() => {
-    if (recommendations && recommendations.length > 0) {
-      setItems(recommendations);
-    }
+  // Sync when parent provides updated recommendations
+  useEffect(() => {
+    setItems(recommendations || []);
   }, [recommendations]);
 
   const toggleItem = (id: string) => {
     setItems((prev) =>
-      prev.map((item) =>
-        item.id === id ? { ...item, checked: !item.checked } : item
-      )
+      prev.map((item) => {
+        if (item.id === id) {
+          // Do not allow checking manual instruction items (e.g. pacman)
+          if (item.actionType === "manual_instruction") return item;
+          return { ...item, checked: !item.checked };
+        }
+        return item;
+      })
     );
   };
 
   const handleSelectAll = (select: boolean) => {
-    setItems((prev) => prev.map((item) => ({ ...item, checked: select })));
+    setItems((prev) =>
+      prev.map((item) =>
+        item.actionType === "manual_instruction"
+          ? item
+          : { ...item, checked: select }
+      )
+    );
   };
 
-  const selectedItems = items.filter((item) => item.checked);
+  const handleSelectSafeOnly = () => {
+    setItems((prev) =>
+      prev.map((item) => ({
+        ...item,
+        checked: item.riskLevel === "safe" && item.actionType !== "manual_instruction",
+      }))
+    );
+  };
+
+  const selectedItems = items.filter(
+    (item) => item.checked && item.actionType !== "manual_instruction"
+  );
+
   const totalReclaimableSelected = selectedItems.reduce(
     (acc, item) => acc + item.reclaimableBytes,
     0
   );
 
-  const handleStartSimulation = () => {
-    setIsCleaning(true);
+  const handleCopyCommand = (cmd: string) => {
+    navigator.clipboard.writeText(cmd).catch(() => {});
+    setCopiedCommand(cmd);
     setTimeout(() => {
-      setIsCleaning(false);
-      setCleanedSuccess(true);
-      setLastFreedAmount(totalReclaimableSelected);
-      // Uncheck cleaned items in demo
-      setItems((prev) =>
-        prev.map((item) => (item.checked ? { ...item, checked: false } : item))
-      );
-    }, 1500);
+      setCopiedCommand(null);
+    }, 2500);
   };
 
-  const handleResetDemo = () => {
-    setItems(mockRecommendations);
-    setCleanedSuccess(false);
+  // Real selective cleanup execution with pre-validation and per-item reporting
+  const handleExecuteCleanup = async () => {
+    if (isDemoMode) {
+      setExecutionError("Cleanup execution is disabled for mock fixtures in Demo Mode.");
+      return;
+    }
+
+    if (selectedItems.length === 0 || isCleaning) return;
+
+    setIsCleaning(true);
+    setExecutionError(null);
+
+    const candidateIds = selectedItems.map((item) => item.id);
+
+    try {
+      const summary = await executeCleanup(candidateIds, cleanupAction);
+      setLastExecutionSummary(summary);
+
+      // Remove successfully cleaned items or mark them 0 bytes
+      const successfulIds = new Set(
+        summary.itemResults
+          .filter((res) => res.success)
+          .map((res) => res.id)
+      );
+
+      setItems((prev) =>
+        prev
+          .filter((item) => !successfulIds.has(item.id))
+          .map((item) => (item.checked ? { ...item, checked: false } : item))
+      );
+
+      if (onCleanupExecuted) {
+        onCleanupExecuted(summary);
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setExecutionError(msg);
+    } finally {
+      setIsCleaning(false);
+    }
+  };
+
+  const handleDismissSummary = () => {
+    setLastExecutionSummary(null);
   };
 
   return (
     <div ref={containerRef} style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
+      {/* Explicit Demo Mode Warning Banner */}
+      {isDemoMode && (
+        <div
+          className="demo-banner reveal-item"
+          style={{
+            borderLeftColor: "var(--accent)",
+            borderColor: "rgba(199, 243, 107, 0.3)",
+            background: "linear-gradient(90deg, rgba(35, 38, 30, 0.95) 0%, rgba(28, 32, 26, 0.95) 100%)",
+          }}
+        >
+          <div className="demo-banner-content">
+            <div className="demo-banner-icon" style={{ color: "var(--accent)" }}>
+              <Sparkles size={18} />
+            </div>
+            <div>
+              <div className="demo-banner-title" style={{ color: "var(--accent)" }}>
+                Demo Mode Active — Preview Fixtures Only
+              </div>
+              <div className="demo-banner-desc">
+                Cleanup execution is strictly disabled for mock fixtures to safeguard real files. Disable demo mode or run a real scan to enable cleaning.
+              </div>
+            </div>
+          </div>
+          <span className="badge-tag accent">
+            <Sparkles size={12} /> Execution Disabled
+          </span>
+        </div>
+      )}
+
       {/* Top Reclaimable Summary Banner */}
       <div
         className="metric-card reveal-item"
@@ -95,22 +207,44 @@ export const CleanupView: React.FC<CleanupViewProps> = ({ recommendations }) => 
             <span style={{ fontSize: "16px", fontWeight: 700, color: "var(--text-primary)" }}>
               Space Reclamation Hub
             </span>
-            <span className="badge-tag accent">Dry-Run Preview</span>
+            <span
+              className="badge-tag accent"
+              style={{
+                background: "rgba(199, 243, 107, 0.15)",
+                color: "var(--accent)",
+                borderColor: "rgba(199, 243, 107, 0.3)",
+              }}
+            >
+              Milestone 3 Live Engine
+            </span>
           </div>
           <div style={{ fontSize: "13px", color: "var(--text-secondary)" }}>
-            Selected <strong>{selectedItems.length}</strong> of {items.length} categories to purge
+            Selected <strong>{selectedItems.length}</strong> of{" "}
+            {items.filter((i) => i.actionType !== "manual_instruction").length} actionable targets to clean
           </div>
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: "24px" }}>
           <div style={{ textAlign: "right" }}>
-            <div style={{ fontSize: "11px", textTransform: "uppercase", letterSpacing: "0.5px", color: "var(--text-secondary)" }}>
-              Selected to Reclaim
+            <div
+              style={{
+                fontSize: "11px",
+                textTransform: "uppercase",
+                letterSpacing: "0.5px",
+                color: "var(--text-secondary)",
+              }}
+            >
+              Estimated to Reclaim
             </div>
             <div
               className="reclaim-counter-value"
               key={totalReclaimableSelected}
-              style={{ fontSize: "28px", fontWeight: 700, color: "var(--accent)", fontVariantNumeric: "tabular-nums" }}
+              style={{
+                fontSize: "28px",
+                fontWeight: 700,
+                color: "var(--accent)",
+                fontVariantNumeric: "tabular-nums",
+              }}
             >
               {formatBytes(totalReclaimableSelected, 1)}
             </div>
@@ -119,39 +253,106 @@ export const CleanupView: React.FC<CleanupViewProps> = ({ recommendations }) => 
           <button
             id="btn-simulate-cleanup"
             className="btn-primary"
-            onClick={() => setIsModalOpen(true)}
-            disabled={selectedItems.length === 0}
+            onClick={() => {
+              setExecutionError(null);
+              setIsModalOpen(true);
+            }}
+            disabled={selectedItems.length === 0 || isDemoMode}
+            title={isDemoMode ? "Cleanup execution disabled in demo mode" : undefined}
             style={{ padding: "10px 20px", fontSize: "14px" }}
           >
             <Trash2 size={16} />
-            <span>Simulate Cleanup</span>
+            <span>
+              {isDemoMode
+                ? "Cleanup Disabled (Demo)"
+                : `Clean Selected (${selectedItems.length})`}
+            </span>
           </button>
         </div>
       </div>
 
-      {cleanedSuccess && (
+      {/* Post-execution notification with exact actual space reclaimed */}
+      {lastExecutionSummary && (
         <div
           className="reveal-item"
           style={{
-            background: "rgba(52, 211, 153, 0.12)",
-            border: "1px solid rgba(52, 211, 153, 0.3)",
+            background:
+              lastExecutionSummary.failureCount === 0
+                ? "rgba(52, 211, 153, 0.12)"
+                : "rgba(251, 191, 36, 0.12)",
+            border: `1px solid ${
+              lastExecutionSummary.failureCount === 0
+                ? "rgba(52, 211, 153, 0.3)"
+                : "rgba(251, 191, 36, 0.3)"
+            }`,
             borderRadius: "var(--radius-md)",
-            padding: "14px 18px",
+            padding: "16px 20px",
             display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            color: "var(--status-success)",
+            flexDirection: "column",
+            gap: "10px",
+            color:
+              lastExecutionSummary.failureCount === 0
+                ? "var(--status-success)"
+                : "var(--status-warning)",
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-            <CheckCircle2 size={18} />
-            <span style={{ fontSize: "13.5px", fontWeight: 500 }}>
-              Dry-run simulation completed! In real mode, <strong>{formatBytes(lastFreedAmount, 1)}</strong> would be safely reclaimed.
-            </span>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <CheckCircle2 size={18} />
+              <span style={{ fontSize: "14px", fontWeight: 600 }}>
+                Cleanup Completed: Actually reclaimed{" "}
+                <strong>{formatBytes(lastExecutionSummary.totalBytesFreed, 1)}</strong> across{" "}
+                {lastExecutionSummary.totalFilesRemoved.toLocaleString()} files (
+                {lastExecutionSummary.successCount} succeeded, {lastExecutionSummary.failureCount} skipped/failed).
+              </span>
+            </div>
+            <button
+              className="btn-secondary"
+              onClick={handleDismissSummary}
+              style={{ fontSize: "12px", padding: "4px 10px" }}
+            >
+              Dismiss
+            </button>
           </div>
-          <button className="btn-secondary" onClick={handleResetDemo} style={{ fontSize: "12px", padding: "4px 10px" }}>
-            Reset Items
-          </button>
+
+          {/* Per-item execution status report */}
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "6px",
+              marginTop: "4px",
+              fontSize: "12px",
+            }}
+          >
+            {lastExecutionSummary.itemResults.map((res) => (
+              <div
+                key={res.id}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  background: "rgba(0,0,0,0.2)",
+                  padding: "6px 10px",
+                  borderRadius: "var(--radius-sm)",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  {res.success ? (
+                    <Check size={14} color="var(--status-success)" />
+                  ) : (
+                    <AlertTriangle size={14} color="var(--status-warning)" />
+                  )}
+                  <span style={{ fontFamily: "'JetBrains Mono', monospace" }}>{res.path || res.id}</span>
+                </div>
+                <span>
+                  {res.success
+                    ? `${formatBytes(res.bytesFreed, 1)} freed (${res.filesRemoved} files)`
+                    : res.error || "Failed"}
+                </span>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
@@ -160,14 +361,21 @@ export const CleanupView: React.FC<CleanupViewProps> = ({ recommendations }) => 
         <div className="files-panel-header">
           <div className="panel-title-group">
             <div className="panel-title">
-              <span>Configured Cleanup Targets</span>
+              <span>Discovered Cleanup Targets</span>
             </div>
             <span className="panel-subtitle">
-              Select safe categories to prune non-essential caches, obsolete package tars, and log archives
+              Verified user caches, FreeDesktop Trash entries, and stale build targets. Revalidated prior to removal.
             </span>
           </div>
 
           <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+            <button
+              className="btn-secondary"
+              onClick={handleSelectSafeOnly}
+              style={{ fontSize: "12px", padding: "6px 12px" }}
+            >
+              Select Safe
+            </button>
             <button
               className="btn-secondary"
               onClick={() => handleSelectAll(true)}
@@ -185,13 +393,42 @@ export const CleanupView: React.FC<CleanupViewProps> = ({ recommendations }) => 
           </div>
         </div>
 
-        <div className="stagger-container" style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
-          {items.map((item) => {
+        {items.length === 0 ? (
+          <div className="state-box" style={{ padding: "48px 24px", margin: "16px 0" }}>
+            <div className="state-icon" style={{ color: "var(--accent)" }}>
+              <Sparkles size={28} />
+            </div>
+            <div className="state-title">
+              {hasCompletedScan
+                ? "No Cleanup Targets Discovered"
+                : "Cleanup Analysis Not Scanned Yet"}
+            </div>
+            <div className="state-desc" style={{ maxWidth: "440px" }}>
+              {hasCompletedScan
+                ? "Your system is clean. No eligible cache directories or trash items were detected."
+                : "Run a storage scan to discover real user caches (~/.cache), FreeDesktop Trash files, and build artifacts."}
+            </div>
+            {!hasCompletedScan && onTriggerScan && (
+              <button
+                className="btn-primary"
+                onClick={onTriggerScan}
+                style={{ marginTop: "14px", fontSize: "13px" }}
+              >
+                <RefreshCw size={14} />
+                <span>Scan Storage</span>
+              </button>
+            )}
+          </div>
+        ) : (
+          <div className="stagger-container" style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+            {items.map((item) => {
             const isChecked = !!item.checked;
+            const isManual = item.actionType === "manual_instruction";
+
             return (
               <div
                 key={item.id}
-                onClick={() => toggleItem(item.id)}
+                onClick={() => !isManual && toggleItem(item.id)}
                 className="rec-item"
                 style={{
                   display: "flex",
@@ -199,31 +436,53 @@ export const CleanupView: React.FC<CleanupViewProps> = ({ recommendations }) => 
                   justifyContent: "space-between",
                   padding: "16px 18px",
                   background: isChecked ? "var(--bg-elevated)" : "var(--bg-card)",
-                  border: isChecked ? "1px solid var(--accent-border)" : "1px solid var(--border-subtle)",
+                  border: isChecked
+                    ? "1px solid var(--accent-border)"
+                    : isManual
+                    ? "1px dashed rgba(251, 191, 36, 0.35)"
+                    : "1px solid var(--border-subtle)",
                   borderRadius: "var(--radius-md)",
-                  cursor: "pointer",
+                  cursor: isManual ? "default" : "pointer",
                 }}
               >
-                <div style={{ display: "flex", alignItems: "flex-start", gap: "14px" }}>
+                <div style={{ display: "flex", alignItems: "flex-start", gap: "14px", flex: 1, marginRight: "16px" }}>
                   <div style={{ color: isChecked ? "var(--accent)" : "var(--text-muted)", marginTop: "2px" }}>
-                    {isChecked ? <CheckSquare size={20} /> : <Square size={20} />}
+                    {isManual ? (
+                      <Terminal size={20} color="var(--status-warning)" />
+                    ) : isChecked ? (
+                      <CheckSquare size={20} />
+                    ) : (
+                      <Square size={20} />
+                    )}
                   </div>
 
-                  <div style={{ display: "flex", flexDirection: "column", gap: "3px" }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <div style={{ display: "flex", flexDirection: "column", gap: "4px", width: "100%" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
                       <span style={{ fontSize: "14px", fontWeight: 600, color: "var(--text-primary)" }}>
                         {item.title}
                       </span>
+
                       {item.riskLevel === "safe" ? (
                         <span
                           className="badge-tag"
                           style={{
                             background: "rgba(52, 211, 153, 0.12)",
                             color: "var(--status-success)",
-                            fontSize: "10px",
+                            fontSize: "10.5px",
                           }}
                         >
                           <ShieldCheck size={11} /> Safe to prune
+                        </span>
+                      ) : isManual ? (
+                        <span
+                          className="badge-tag"
+                          style={{
+                            background: "rgba(251, 191, 36, 0.12)",
+                            color: "var(--status-warning)",
+                            fontSize: "10.5px",
+                          }}
+                        >
+                          <Terminal size={11} /> Manual Command Required
                         </span>
                       ) : (
                         <span
@@ -231,10 +490,23 @@ export const CleanupView: React.FC<CleanupViewProps> = ({ recommendations }) => 
                           style={{
                             background: "rgba(251, 191, 36, 0.12)",
                             color: "var(--status-warning)",
-                            fontSize: "10px",
+                            fontSize: "10.5px",
                           }}
                         >
                           <AlertTriangle size={11} /> Review Recommended
+                        </span>
+                      )}
+
+                      {item.category === "trash" && (
+                        <span
+                          className="badge-tag"
+                          style={{
+                            background: "rgba(56, 189, 248, 0.12)",
+                            color: "#38BDF8",
+                            fontSize: "10.5px",
+                          }}
+                        >
+                          <Archive size={11} /> FreeDesktop Trash
                         </span>
                       )}
                     </div>
@@ -242,6 +514,12 @@ export const CleanupView: React.FC<CleanupViewProps> = ({ recommendations }) => 
                     <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
                       {item.description}
                     </span>
+
+                    {item.reason && (
+                      <span style={{ fontSize: "11.5px", color: "var(--text-muted)", fontStyle: "italic" }}>
+                        Reason: {item.reason}
+                      </span>
+                    )}
 
                     <span
                       style={{
@@ -253,10 +531,53 @@ export const CleanupView: React.FC<CleanupViewProps> = ({ recommendations }) => 
                     >
                       Target: {item.path} ({formatNumber(item.fileCount)} files)
                     </span>
+
+                    {/* Explanatory command snippet for package managers (Requirement D) */}
+                    {isManual && item.manualCommand && (
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "8px",
+                          marginTop: "6px",
+                          background: "var(--bg-panel-subtle)",
+                          padding: "6px 10px",
+                          borderRadius: "var(--radius-sm)",
+                          border: "1px solid var(--border-subtle)",
+                          width: "fit-content",
+                        }}
+                      >
+                        <Terminal size={13} color="var(--accent)" />
+                        <code style={{ fontSize: "11.5px", color: "var(--accent)", fontFamily: "'JetBrains Mono', monospace" }}>
+                          {item.manualCommand}
+                        </code>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleCopyCommand(item.manualCommand!);
+                          }}
+                          className="btn-secondary"
+                          style={{ padding: "2px 6px", fontSize: "10px", display: "flex", alignItems: "center", gap: "4px" }}
+                          title="Copy command to clipboard"
+                        >
+                          {copiedCommand === item.manualCommand ? (
+                            <>
+                              <Check size={11} color="var(--status-success)" />
+                              <span>Copied!</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy size={11} />
+                              <span>Copy</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
 
-                <div style={{ textAlign: "right" }}>
+                <div style={{ textAlign: "right", whiteSpace: "nowrap" }}>
                   <span
                     style={{
                       fontSize: "15px",
@@ -272,16 +593,17 @@ export const CleanupView: React.FC<CleanupViewProps> = ({ recommendations }) => 
             );
           })}
         </div>
+        )}
       </div>
 
-      {/* Simulation Modal */}
+      {/* Confirmation & Execution Modal */}
       {isModalOpen && (
         <div className="modal-backdrop">
-          <div className="modal-content">
+          <div className="modal-content" style={{ maxWidth: "560px" }}>
             <div className="modal-header">
               <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                <Sparkles size={18} color="var(--accent)" />
-                <span style={{ fontWeight: 700, fontSize: "15px" }}>Simulate Storage Cleanup</span>
+                <Trash2 size={18} color="var(--accent)" />
+                <span style={{ fontWeight: 700, fontSize: "15px" }}>Confirm Storage Cleanup</span>
               </div>
               <button
                 onClick={() => !isCleaning && setIsModalOpen(false)}
@@ -291,39 +613,144 @@ export const CleanupView: React.FC<CleanupViewProps> = ({ recommendations }) => 
               </button>
             </div>
 
-            <div className="modal-body">
+            <div className="modal-body" style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+              {/* Cleanup Operation Mode Selector */}
+              <div>
+                <label style={{ fontSize: "12px", fontWeight: 600, color: "var(--text-secondary)", marginBottom: "6px", display: "block" }}>
+                  Cleanup Mode:
+                </label>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
+                  <button
+                    type="button"
+                    onClick={() => setCleanupAction("trash")}
+                    className={cleanupAction === "trash" ? "btn-primary" : "btn-secondary"}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      gap: "6px",
+                      padding: "8px 12px",
+                      fontSize: "12.5px",
+                    }}
+                  >
+                    <Archive size={14} />
+                    <span>Move to Trash (Safe)</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setCleanupAction("permanent_delete")}
+                    className={cleanupAction === "permanent_delete" ? "btn-danger" : "btn-secondary"}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      gap: "6px",
+                      padding: "8px 12px",
+                      fontSize: "12.5px",
+                      borderColor: cleanupAction === "permanent_delete" ? "rgba(239, 68, 68, 0.4)" : undefined,
+                    }}
+                  >
+                    <Trash2 size={14} />
+                    <span>Permanently Delete</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Explanatory Mode Banner */}
               <div
                 style={{
-                  background: "var(--bg-panel-subtle)",
-                  border: "1px solid var(--border-subtle)",
+                  background:
+                    cleanupAction === "trash"
+                      ? "rgba(56, 189, 248, 0.08)"
+                      : "rgba(239, 68, 68, 0.08)",
+                  border: `1px solid ${
+                    cleanupAction === "trash"
+                      ? "rgba(56, 189, 248, 0.25)"
+                      : "rgba(239, 68, 68, 0.25)"
+                  }`,
                   borderRadius: "var(--radius-md)",
-                  padding: "14px",
-                  fontSize: "13px",
+                  padding: "10px 14px",
+                  fontSize: "12.5px",
                   color: "var(--text-secondary)",
                 }}
               >
-                <strong style={{ color: "var(--text-primary)" }}>Milestone 1 Safe Sandbox:</strong>
-                <p style={{ marginTop: "4px" }}>
-                  This simulation computes and validates space reclamation without modifying, deleting, or invoking filesystem commands. In Milestone 2, this will link to native Rust commands with safety confirmation.
-                </p>
+                {cleanupAction === "trash" ? (
+                  <div>
+                    <strong style={{ color: "#38BDF8" }}>FreeDesktop Trash Integration:</strong>
+                    <p style={{ marginTop: "3px" }}>
+                      Eligible files will be safely moved to ~/.local/share/Trash preserving timestamps and original path metadata. You can inspect or restore them at any time.
+                    </p>
+                  </div>
+                ) : (
+                  <div>
+                    <strong style={{ color: "#F87171" }}>Permanent Removal:</strong>
+                    <p style={{ marginTop: "3px" }}>
+                      Selected files and cache contents will be permanently deleted from disk. This operation recovers disk space immediately and cannot be undone.
+                    </p>
+                  </div>
+                )}
               </div>
 
+              {/* Exact Targets Confirmation List */}
               <div>
-                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "8px", fontSize: "13px" }}>
-                  <span>Targets to clean:</span>
-                  <strong style={{ color: "var(--text-primary)" }}>{selectedItems.length} categories</strong>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "6px", fontSize: "12px", color: "var(--text-muted)" }}>
+                  <span>Exact target paths ({selectedItems.length}):</span>
+                  <span>Estimated: {formatBytes(totalReclaimableSelected, 1)}</span>
                 </div>
-                <div style={{ display: "flex", justifyContent: "space-between", fontSize: "14px" }}>
-                  <span>Estimated space reclaimed:</span>
-                  <strong style={{ color: "var(--accent)" }}>{formatBytes(totalReclaimableSelected, 1)}</strong>
+
+                <div
+                  style={{
+                    maxHeight: "150px",
+                    overflowY: "auto",
+                    background: "var(--bg-panel-subtle)",
+                    border: "1px solid var(--border-subtle)",
+                    borderRadius: "var(--radius-sm)",
+                    padding: "8px 12px",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "6px",
+                  }}
+                >
+                  {selectedItems.map((item) => (
+                    <div
+                      key={item.id}
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        fontSize: "11.5px",
+                        fontFamily: "'JetBrains Mono', monospace",
+                        color: "var(--text-primary)",
+                      }}
+                    >
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "360px" }}>
+                        {item.path}
+                      </span>
+                      <span style={{ color: "var(--accent)" }}>{formatBytes(item.reclaimableBytes, 0)}</span>
+                    </div>
+                  ))}
                 </div>
               </div>
+
+              {/* Safety & Pre-validation note */}
+              <div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "11.5px", color: "var(--text-muted)" }}>
+                <Info size={13} color="var(--accent)" />
+                <span>
+                  Backend strictly revalidates path boundaries, non-symlink metadata, and permissions prior to deletion.
+                </span>
+              </div>
+
+              {executionError && (
+                <div style={{ color: "#F87171", fontSize: "12px", background: "rgba(239, 68, 68, 0.1)", padding: "8px 12px", borderRadius: "var(--radius-sm)" }}>
+                  {executionError}
+                </div>
+              )}
 
               {isCleaning && (
-                <div style={{ marginTop: "12px", display: "flex", flexDirection: "column", gap: "8px" }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
                   <div style={{ display: "flex", alignItems: "center", gap: "8px", color: "var(--accent)", fontSize: "13px" }}>
                     <RefreshCw size={14} className="spin-animation" style={{ animation: "spin 1s linear infinite" }} />
-                    <span>Running simulated clean on /var/cache and build folders...</span>
+                    <span>Executing validated cleanup...</span>
                   </div>
                   <div className="disk-widget-bar" style={{ height: "6px" }}>
                     <div className="disk-widget-fill" style={{ width: "100%", animation: "pulse 1s infinite" }} />
@@ -341,17 +768,21 @@ export const CleanupView: React.FC<CleanupViewProps> = ({ recommendations }) => 
                 Cancel
               </button>
               <button
-                className="btn-primary"
-                onClick={() => {
-                  handleStartSimulation();
-                  setTimeout(() => {
-                    setIsModalOpen(false);
-                  }, 1600);
+                className={cleanupAction === "permanent_delete" ? "btn-danger" : "btn-primary"}
+                onClick={async () => {
+                  await handleExecuteCleanup();
+                  setIsModalOpen(false);
                 }}
                 disabled={isCleaning}
               >
-                <Trash2 size={15} />
-                <span>{isCleaning ? "Simulating..." : "Confirm & Simulate"}</span>
+                {cleanupAction === "permanent_delete" ? <Trash2 size={15} /> : <Archive size={15} />}
+                <span>
+                  {isCleaning
+                    ? "Processing..."
+                    : cleanupAction === "permanent_delete"
+                    ? "Permanently Delete Selected"
+                    : "Move Selected to Trash"}
+                </span>
               </button>
             </div>
           </div>

@@ -13,10 +13,12 @@ import {
 } from "lucide-react";
 import { FileItem } from "../../types/storage";
 import { formatBytes } from "../../mock/storageData";
+import { RefreshCw } from "lucide-react";
 
 interface LargestFilesTableProps {
   files: FileItem[];
   onInspectFile?: (file: FileItem) => void;
+  onTriggerScan?: () => void;
 }
 
 type SortField = "size" | "name" | "lastModified";
@@ -25,6 +27,7 @@ type SortOrder = "asc" | "desc";
 export const LargestFilesTable: React.FC<LargestFilesTableProps> = ({
   files,
   onInspectFile,
+  onTriggerScan,
 }) => {
   const [searchQuery, setSearchQuery] = useState("");
   const [sortField, setSortField] = useState<SortField>("size");
@@ -124,7 +127,27 @@ export const LargestFilesTable: React.FC<LargestFilesTableProps> = ({
         </div>
       </div>
 
-      {filteredAndSortedFiles.length === 0 ? (
+      {files.length === 0 ? (
+        <div className="state-box" style={{ padding: "44px 20px", margin: "10px 0" }}>
+          <div className="state-icon" style={{ color: "var(--accent)" }}>
+            <FileText size={24} />
+          </div>
+          <div className="state-title">Largest Files Not Scanned Yet</div>
+          <div className="state-desc" style={{ maxWidth: "420px" }}>
+            Top storage-consuming files across your drive will be discovered and listed here after running a storage scan.
+          </div>
+          {onTriggerScan && (
+            <button
+              className="btn-primary"
+              onClick={onTriggerScan}
+              style={{ marginTop: "12px", fontSize: "12.5px" }}
+            >
+              <RefreshCw size={13} />
+              <span>Scan Storage</span>
+            </button>
+          )}
+        </div>
+      ) : filteredAndSortedFiles.length === 0 ? (
         <div style={{ padding: "32px 0", textAlign: "center", color: "var(--text-muted)" }}>
           No files match "<strong>{searchQuery}</strong>". Try a different query.
         </div>

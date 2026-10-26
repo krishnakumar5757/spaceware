@@ -55,7 +55,7 @@ struct CategoryStats {
     count: u64,
 }
 
-fn classify_file(ext: &str, path_str: &str) -> (&'static str, &'static str) {
+pub fn classify_file(ext: &str, path_str: &str) -> (&'static str, &'static str) {
     let lower_ext = ext.to_lowercase();
     let lower_path = path_str.to_lowercase();
 
@@ -209,6 +209,7 @@ impl DirectoryScanner {
                 total_bytes: self.total_bytes,
                 used_bytes: self.total_bytes,
                 free_bytes: 0,
+                available_bytes: 0,
                 reclaimable_bytes: 0,
                 last_scanned: "Just now".to_string(),
                 is_live_data: true,
@@ -271,6 +272,217 @@ impl DirectoryScanner {
 
         Ok(ScanResult {
             root_path: self.options.path.clone(),
+            summary,
+            categories: storage_categories,
+            largest_files: largest_file_items,
+            recommendations,
+            directory_tree: tree_node,
+            total_files_scanned: self.total_files,
+            total_dirs_scanned: self.total_dirs,
+            total_bytes_scanned: self.total_bytes,
+            permission_denied_count: self.permission_denied_paths.len() as u64,
+            permission_denied_paths: self.permission_denied_paths.clone(),
+            scan_duration_ms,
+            is_live_data: true,
+        })
+    }
+
+    pub fn scan_multiple_targets<F>(
+        &mut self,
+        targets: &[PathBuf],
+        progress_cb: Option<F>,
+    ) -> Result<ScanResult, String>
+    where
+        F: Fn(ScanProgress),
+    {
+        if targets.is_empty() {
+            return Err("No targets provided for scan".to_string());
+        }
+
+        let max_tree_depth = self.options.max_tree_depth.unwrap_or(3);
+        let mut child_nodes = Vec::new();
+        let mut total_root_size = 0u64;
+        let mut total_root_files = 0u64;
+
+        for target in targets {
+            if self.cancel_flag.load(Ordering::Relaxed) {
+                return Err("Scan was cancelled by user".to_string());
+            }
+
+            let meta = match fs::symlink_metadata(target) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.permission_denied_paths.push(format!("{}: {}", target.display(), e));
+                    continue;
+                }
+            };
+
+            if meta.file_type().is_symlink() {
+                // Do not follow symlinks
+                continue;
+            }
+
+            if meta.is_dir() {
+                let node = self.scan_dir_recursive(target, 0, max_tree_depth, &progress_cb)?;
+                total_root_size += node.size_bytes;
+                total_root_files += node.file_count.unwrap_or(0);
+                child_nodes.push(node);
+            } else {
+                let size = meta.len();
+                let name = target.file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string();
+                let ext = target.extension().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                let path_str = target.to_string_lossy().to_string();
+                let (cat_id, _) = classify_file(&ext, &path_str);
+
+                if let Some(cat) = self.categories.iter_mut().find(|c| c.id == cat_id) {
+                    cat.size += size;
+                    cat.count += 1;
+                }
+
+                self.total_files += 1;
+                self.total_bytes += size;
+                total_root_size += size;
+                total_root_files += 1;
+
+                let mtime = meta.mtime() as u64;
+                let atime = meta.atime() as u64;
+
+                let tracked = TrackedFile {
+                    path: target.clone(),
+                    name: name.clone(),
+                    size,
+                    extension: ext.clone(),
+                    category: cat_id.to_string(),
+                    mtime,
+                    atime,
+                };
+
+                if self.largest_files.len() < self.max_largest {
+                    self.largest_files.push(tracked);
+                } else if let Some(smallest) = self.largest_files.peek() {
+                    if tracked.size > smallest.size {
+                        self.largest_files.pop();
+                        self.largest_files.push(tracked);
+                    }
+                }
+
+                child_nodes.push(DirectoryNode {
+                    id: format!("node-{}", path_str),
+                    name,
+                    path: path_str,
+                    size_bytes: size,
+                    node_type: "file".to_string(),
+                    file_count: Some(1),
+                    category: Some(cat_id.to_string()),
+                    children: None,
+                });
+
+                if let Some(ref cb) = progress_cb {
+                    cb(ScanProgress {
+                        is_scanning: true,
+                        progress_percent: 50,
+                        current_path: target.to_string_lossy().to_string(),
+                        files_scanned_count: self.total_files,
+                        bytes_scanned: self.total_bytes,
+                    });
+                }
+            }
+        }
+
+        let root_title = if targets.len() == 1 {
+            targets[0].file_name().and_then(|s| s.to_str()).unwrap_or("Selected Target").to_string()
+        } else {
+            format!("Selected Items ({} targets)", targets.len())
+        };
+
+        let root_path_str = if targets.len() == 1 {
+            targets[0].to_string_lossy().to_string()
+        } else {
+            targets[0].parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "/".to_string())
+        };
+
+        let tree_node = DirectoryNode {
+            id: "root-selected-targets".to_string(),
+            name: root_title,
+            path: root_path_str.clone(),
+            size_bytes: total_root_size,
+            node_type: "folder".to_string(),
+            file_count: Some(total_root_files),
+            category: None,
+            children: Some(child_nodes),
+        };
+
+        let scan_duration_ms = self.start_time.elapsed().as_millis() as u64;
+
+        let primary_path = &targets[0];
+        let mut summary = get_storage_summary_for_path(primary_path).unwrap_or_else(|_| {
+            crate::models::StorageSummary {
+                drive_name: "Local Volume".to_string(),
+                mount_point: root_path_str.clone(),
+                filesystem: "Local".to_string(),
+                total_bytes: self.total_bytes,
+                used_bytes: self.total_bytes,
+                free_bytes: 0,
+                available_bytes: 0,
+                reclaimable_bytes: 0,
+                last_scanned: "Just now".to_string(),
+                is_live_data: true,
+            }
+        });
+
+        let total_used = if summary.used_bytes > 0 {
+            summary.used_bytes
+        } else {
+            self.total_bytes.max(1)
+        };
+
+        let storage_categories: Vec<StorageCategory> = self
+            .categories
+            .iter()
+            .map(|c| {
+                let pct = (c.size as f64 / total_used as f64) * 100.0;
+                StorageCategory {
+                    id: c.id.to_string(),
+                    name: c.name.to_string(),
+                    size_bytes: c.size,
+                    file_count: c.count,
+                    color: c.color.to_string(),
+                    icon_name: c.icon.to_string(),
+                    description: c.description.to_string(),
+                    percentage_of_used: (pct * 10.0).round() / 10.0,
+                }
+            })
+            .collect();
+
+        let mut sorted_largest: Vec<TrackedFile> = self.largest_files.clone().into_vec();
+        sorted_largest.sort_by(|a, b| b.size.cmp(&a.size));
+
+        let largest_file_items: Vec<FileItem> = sorted_largest
+            .into_iter()
+            .enumerate()
+            .map(|(idx, f)| {
+                let mtime_str = format_epoch_date(f.mtime);
+                let atime_str = format_epoch_date(f.atime);
+                FileItem {
+                    id: format!("real-file-{}", idx + 1),
+                    name: f.name,
+                    path: f.path.to_string_lossy().to_string(),
+                    size_bytes: f.size,
+                    category: f.category,
+                    extension: f.extension,
+                    last_modified: mtime_str,
+                    last_accessed: atime_str,
+                    is_locked: false,
+                }
+            })
+            .collect();
+
+        let recommendations = self.detect_cleanup_recommendations();
+        let reclaimable_sum = recommendations.iter().map(|r| r.reclaimable_bytes).sum();
+        summary.reclaimable_bytes = reclaimable_sum;
+
+        Ok(ScanResult {
+            root_path: root_path_str,
             summary,
             categories: storage_categories,
             largest_files: largest_file_items,
@@ -466,136 +678,12 @@ impl DirectoryScanner {
 
     /// Checks for real, actionable cleanup candidates on disk
     fn detect_cleanup_recommendations(&self) -> Vec<CleanupRecommendation> {
-        let mut recs = Vec::new();
-        let home_dir = std::env::var("HOME").unwrap_or_default();
-
-        // 1. Pacman cache on Arch / CachyOS
-        let pacman_pkg = Path::new("/var/cache/pacman/pkg");
-        if pacman_pkg.exists() {
-            if let Ok(size) = compute_shallow_size(pacman_pkg) {
-                if size > 10 * 1024 * 1024 {
-                    recs.push(CleanupRecommendation {
-                        id: "rec-real-pacman".to_string(),
-                        title: "Pacman Package Cache".to_string(),
-                        category: "cache".to_string(),
-                        description: "Old cached tarballs in /var/cache/pacman/pkg.".to_string(),
-                        reclaimable_bytes: size,
-                        file_count: 50,
-                        risk_level: "safe".to_string(),
-                        path: "/var/cache/pacman/pkg".to_string(),
-                        checked: true,
-                    });
-                }
-            }
-        }
-
-        // 2. User Trash
-        if !home_dir.is_empty() {
-            let trash_path = PathBuf::from(&home_dir).join(".local/share/Trash");
-            if trash_path.exists() {
-                if let Ok(size) = compute_shallow_size(&trash_path) {
-                    if size > 1024 * 1024 {
-                        recs.push(CleanupRecommendation {
-                            id: "rec-real-trash".to_string(),
-                            title: "User Trash Bin".to_string(),
-                            category: "trash".to_string(),
-                            description: "Deleted files stored in ~/.local/share/Trash.".to_string(),
-                            reclaimable_bytes: size,
-                            file_count: 12,
-                            risk_level: "caution".to_string(),
-                            path: trash_path.to_string_lossy().to_string(),
-                            checked: false,
-                        });
-                    }
-                }
-            }
-
-            // 3. Browser & Cache directories
-            let chrome_cache = PathBuf::from(&home_dir).join(".cache/google-chrome");
-            if chrome_cache.exists() {
-                if let Ok(size) = compute_shallow_size(&chrome_cache) {
-                    if size > 50 * 1024 * 1024 {
-                        recs.push(CleanupRecommendation {
-                            id: "rec-real-browser".to_string(),
-                            title: "Chrome Browser Cache".to_string(),
-                            category: "cache".to_string(),
-                            description: "Temporary web data and media cache in ~/.cache/google-chrome.".to_string(),
-                            reclaimable_bytes: size,
-                            file_count: 500,
-                            risk_level: "safe".to_string(),
-                            path: chrome_cache.to_string_lossy().to_string(),
-                            checked: true,
-                        });
-                    }
-                }
-            }
-
-            // 4. Cargo / Rust cache
-            let cargo_cache = PathBuf::from(&home_dir).join(".cache/cargo");
-            if cargo_cache.exists() {
-                if let Ok(size) = compute_shallow_size(&cargo_cache) {
-                    if size > 50 * 1024 * 1024 {
-                        recs.push(CleanupRecommendation {
-                            id: "rec-real-cargo".to_string(),
-                            title: "Cargo Git & Registry Cache".to_string(),
-                            category: "developer".to_string(),
-                            description: "Downloaded cargo crates in ~/.cache/cargo.".to_string(),
-                            reclaimable_bytes: size,
-                            file_count: 320,
-                            risk_level: "safe".to_string(),
-                            path: cargo_cache.to_string_lossy().to_string(),
-                            checked: true,
-                        });
-                    }
-                }
-            }
-        }
-
-        // If no large caches detected, provide standard safe recommendation
-        if recs.is_empty() {
-            recs.push(CleanupRecommendation {
-                id: "rec-real-general".to_string(),
-                title: "Temporary & Runtime Caches".to_string(),
-                category: "cache".to_string(),
-                description: "User cache directories in ~/.cache that can be safely rebuilt.".to_string(),
-                reclaimable_bytes: 512 * 1024 * 1024,
-                file_count: 240,
-                risk_level: "safe".to_string(),
-                path: "~/.cache".to_string(),
-                checked: true,
-            });
-        }
-
-        recs
+        crate::cleanup::discover_real_cleanup_candidates()
     }
 }
 
-/// Helper to compute directory size bounded to depth 2 for quick detection
-fn compute_shallow_size(dir: &Path) -> Result<u64, ()> {
-    let mut total: u64 = 0;
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                if meta.is_file() {
-                    total += meta.len();
-                } else if meta.is_dir() {
-                    if let Ok(sub_entries) = fs::read_dir(entry.path()) {
-                        for sub in sub_entries.flatten() {
-                            if let Ok(m) = sub.metadata() {
-                                if m.is_file() {
-                                    total += m.len();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(total)
-}
 
-fn format_epoch_date(secs: u64) -> String {
+pub fn format_epoch_date(secs: u64) -> String {
     if secs == 0 {
         return "Unknown".to_string();
     }
@@ -831,6 +919,76 @@ mod tests {
         assert_eq!(result.largest_files.len(), 2);
         assert_eq!(result.largest_files[0].name, "clip.mp4");
         assert_eq!(result.largest_files[0].last_modified, "Today");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_scan_single_file_target() {
+        let temp_dir = std::env::temp_dir().join(format!("spacewise_single_file_test_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let single_file = temp_dir.join("single_target.bin");
+        let mut f = fs::File::create(&single_file).unwrap();
+        f.write_all(&vec![b'Z'; 5120]).unwrap();
+
+        let options = ScanOptions {
+            path: temp_dir.to_string_lossy().to_string(),
+            max_tree_depth: Some(3),
+            exclude_paths: vec![],
+            same_filesystem: true,
+            large_file_threshold_mb: None,
+        };
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let mut scanner = DirectoryScanner::new(options, cancel_flag).unwrap();
+        let result = scanner.scan_multiple_targets::<fn(ScanProgress)>(&[single_file], None).unwrap();
+
+        assert_eq!(result.total_files_scanned, 1);
+        assert_eq!(result.total_bytes_scanned, 5120);
+        assert_eq!(result.directory_tree.size_bytes, 5120);
+        assert_eq!(result.directory_tree.file_count, Some(1));
+        assert_eq!(result.largest_files.len(), 1);
+        assert_eq!(result.largest_files[0].name, "single_target.bin");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_scan_multiple_targets_mixed_and_cancellation() {
+        let temp_dir = std::env::temp_dir().join(format!("spacewise_multi_target_test_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let folder = temp_dir.join("folder_target");
+        fs::create_dir_all(&folder).unwrap();
+        fs::File::create(folder.join("nested.txt")).unwrap().write_all(b"12345").unwrap();
+
+        let file = temp_dir.join("file_target.txt");
+        fs::File::create(&file).unwrap().write_all(b"67890").unwrap();
+
+        let options = ScanOptions {
+            path: temp_dir.to_string_lossy().to_string(),
+            max_tree_depth: Some(3),
+            exclude_paths: vec![],
+            same_filesystem: true,
+            large_file_threshold_mb: None,
+        };
+
+        // 1. Successful mixed scan
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let mut scanner = DirectoryScanner::new(options.clone(), cancel_flag).unwrap();
+        let result = scanner.scan_multiple_targets::<fn(ScanProgress)>(&[folder.clone(), file.clone()], None).unwrap();
+
+        assert_eq!(result.total_files_scanned, 2);
+        assert_eq!(result.total_bytes_scanned, 10);
+        assert_eq!(result.directory_tree.children.as_ref().unwrap().len(), 2);
+
+        // 2. Cancellation
+        let cancel_flag2 = Arc::new(AtomicBool::new(true)); // Pre-cancelled
+        let mut scanner2 = DirectoryScanner::new(options, cancel_flag2).unwrap();
+        let cancel_err = scanner2.scan_multiple_targets::<fn(ScanProgress)>(&[folder, file], None);
+        assert!(cancel_err.is_err());
+        assert!(cancel_err.unwrap_err().contains("cancelled"));
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

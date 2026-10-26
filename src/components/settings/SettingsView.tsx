@@ -5,17 +5,22 @@ import {
   Info,
   CheckCircle2,
   AlertTriangle,
+  Sparkles,
 } from "lucide-react";
 import { useScrollRevealContainer } from "../../hooks/useScrollReveal";
 
 interface SettingsViewProps {
   onToggleSimulateError?: (enable: boolean) => void;
   isSimulatedErrorActive?: boolean;
+  isDemoMode?: boolean;
+  onToggleDemoMode?: (enable: boolean) => void;
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
   onToggleSimulateError,
   isSimulatedErrorActive = false,
+  isDemoMode = false,
+  onToggleDemoMode,
 }) => {
   const containerRef = useScrollRevealContainer<HTMLDivElement>();
 
@@ -202,6 +207,30 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             style={{ fontSize: "12px", padding: "6px 14px" }}
           >
             {isSimulatedErrorActive ? "Disable Error State" : "Simulate Error State"}
+          </button>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 0", borderTop: "1px solid var(--border-subtle)" }}>
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <span style={{ fontSize: "13.5px", fontWeight: 600, color: "var(--text-primary)" }}>
+                Demo Mode Preview (Development Fixture)
+              </span>
+              <span className="badge-tag accent" style={{ fontSize: "10.5px" }}>
+                <Sparkles size={11} /> Opt-In Only
+              </span>
+            </div>
+            <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginTop: "2px", maxWidth: "560px" }}>
+              Loads mock storage values (1000 GB, categories, sample files) for UI design previews. Cleanup execution is strictly disabled. Real startup always uses native Linux filesystems.
+            </div>
+          </div>
+
+          <button
+            className={isDemoMode ? "btn-danger" : "btn-secondary"}
+            onClick={() => onToggleDemoMode && onToggleDemoMode(!isDemoMode)}
+            style={{ fontSize: "12px", padding: "6px 14px" }}
+          >
+            {isDemoMode ? "Disable Demo Mode" : "Enable Demo Mode"}
           </button>
         </div>
       </div>

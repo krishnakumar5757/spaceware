@@ -5,6 +5,7 @@ import { NavigationTab, ScanStatus } from "../../types/storage";
 interface HeaderProps {
   currentTab: NavigationTab;
   scanStatus: ScanStatus;
+  isDemoMode?: boolean;
   onTriggerScan: () => void;
   onCancelScan?: () => void;
 }
@@ -31,10 +32,29 @@ const TAB_TITLES: Record<NavigationTab, { title: string; subtitle: string }> = {
 export const Header: React.FC<HeaderProps> = ({
   currentTab,
   scanStatus,
+  isDemoMode = false,
   onTriggerScan,
   onCancelScan,
 }) => {
   const meta = TAB_TITLES[currentTab];
+
+  const getStatusText = () => {
+    if (isDemoMode) return "Demo: Preview Fixtures";
+    if (scanStatus.state === "initializing") return "Initializing...";
+    if (scanStatus.state === "no_filesystem") return "Mount Error";
+    if (scanStatus.state === "failed") return "Scan Failed";
+    if (scanStatus.state === "ready" || !scanStatus.lastCompleted || scanStatus.lastCompleted === "Not scanned yet") {
+      return "Ready to scan";
+    }
+    return `Live scan: ${scanStatus.lastCompleted}`;
+  };
+
+  const getIndicatorColor = () => {
+    if (isDemoMode) return "var(--accent)";
+    if (scanStatus.state === "no_filesystem" || scanStatus.state === "failed") return "var(--status-danger)";
+    if (scanStatus.state === "completed" || scanStatus.state === "completed_with_errors") return "var(--status-success)";
+    return "var(--accent)";
+  };
 
   return (
     <header className="top-header">
@@ -82,14 +102,12 @@ export const Header: React.FC<HeaderProps> = ({
               <div
                 className="pulse-indicator"
                 style={{
-                  backgroundColor: scanStatus.isLiveData
-                    ? "var(--status-success)"
-                    : "var(--accent)",
+                  backgroundColor: getIndicatorColor(),
                 }}
               />
               <span style={{ display: "flex", alignItems: "center", gap: "5px" }}>
                 <Clock size={12} color="var(--text-muted)" />
-                {scanStatus.isLiveData ? "Live scan" : "Demo"}: {scanStatus.lastCompleted}
+                {getStatusText()}
               </span>
             </>
           )}

@@ -21,6 +21,8 @@ pub struct StorageSummary {
     pub total_bytes: u64,
     pub used_bytes: u64,
     pub free_bytes: u64,
+    #[serde(default)]
+    pub available_bytes: u64,
     pub reclaimable_bytes: u64,
     pub last_scanned: String,
     #[serde(default)]
@@ -60,7 +62,7 @@ pub struct FileItem {
 pub struct CleanupRecommendation {
     pub id: String,
     pub title: String,
-    pub category: String, // "cache" | "developer" | "logs" | "trash" | "old_files"
+    pub category: String, // "cache" | "developer" | "logs" | "trash" | "package_cache" | "old_files"
     pub description: String,
     pub reclaimable_bytes: u64,
     pub file_count: u64,
@@ -68,10 +70,44 @@ pub struct CleanupRecommendation {
     pub path: String,
     #[serde(default = "default_checked")]
     pub checked: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub action_type: Option<String>, // "trash" | "permanent_delete" | "manual_instruction"
+    #[serde(default)]
+    pub manual_command: Option<String>,
 }
 
 fn default_checked() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupActionRequest {
+    pub candidate_ids: Vec<String>,
+    pub action: String, // "trash" | "permanent_delete"
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupItemResult {
+    pub id: String,
+    pub path: String,
+    pub success: bool,
+    pub bytes_freed: u64,
+    pub files_removed: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupExecutionSummary {
+    pub total_bytes_freed: u64,
+    pub total_files_removed: u64,
+    pub item_results: Vec<CleanupItemResult>,
+    pub success_count: usize,
+    pub failure_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

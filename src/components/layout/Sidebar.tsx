@@ -14,16 +14,27 @@ interface SidebarProps {
   currentTab: NavigationTab;
   onSelectTab: (tab: NavigationTab) => void;
   storageSummary: StorageSummary;
+  isDemoMode?: boolean;
+  hasCompletedScan?: boolean;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
   currentTab,
   onSelectTab,
   storageSummary,
+  isDemoMode = false,
+  hasCompletedScan = false,
 }) => {
-  const usedPercent = Math.round(
-    (storageSummary.usedBytes / storageSummary.totalBytes) * 100
+  const total = storageSummary.totalBytes > 0 ? storageSummary.totalBytes : 1;
+  const usedPercent = Math.min(
+    100,
+    Math.round((storageSummary.usedBytes / total) * 100)
   );
+
+  const availBytes =
+    typeof storageSummary.availableBytes === "number" && storageSummary.availableBytes > 0
+      ? storageSummary.availableBytes
+      : storageSummary.freeBytes;
 
   return (
     <aside className="sidebar">
@@ -36,7 +47,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <div className="brand-info">
               <span className="brand-title">
                 Spacewise
-                {storageSummary.isLiveData ? (
+                {isDemoMode ? (
+                  <span className="badge-demo">Demo</span>
+                ) : storageSummary.isLiveData ? (
                   <span
                     className="badge-demo"
                     style={{
@@ -47,9 +60,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   >
                     Live
                   </span>
-                ) : (
-                  <span className="badge-demo">Demo</span>
-                )}
+                ) : null}
               </span>
               <span className="brand-subtitle">Disk Storage Manager</span>
             </div>
@@ -86,7 +97,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <Sparkles size={18} className="nav-icon" />
             <span className="nav-label">Cleanup</span>
             <span className="nav-badge accent">
-              {formatBytes(storageSummary.reclaimableBytes, 0)}
+              {hasCompletedScan
+                ? formatBytes(storageSummary.reclaimableBytes, 0)
+                : "—"}
             </span>
           </button>
 
@@ -126,7 +139,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
           <div className="disk-widget-footer">
             <span>{formatBytes(storageSummary.usedBytes, 0)} used</span>
-            <span>{formatBytes(storageSummary.freeBytes, 0)} free</span>
+            <span>{formatBytes(availBytes, 0)} free</span>
           </div>
         </div>
 
