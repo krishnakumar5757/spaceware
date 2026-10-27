@@ -1324,6 +1324,23 @@ pub fn execute_validated_cleanup(
     let mut failure_count = 0;
 
     for candidate_id in request.candidate_ids {
+        // 0. Explicit safety guard: pacman package cache manual instruction item
+        // is strictly prohibited from direct deletion for system safety, even if absent or in non-Arch environments.
+        if candidate_id == "rec-pacman-pkg-manual" {
+            failure_count += 1;
+            item_results.push(CleanupItemResult {
+                id: candidate_id,
+                path: "/var/cache/pacman/pkg".to_string(),
+                success: false,
+                bytes_freed: 0,
+                files_removed: 0,
+                error: Some(
+                    "Direct deletion is prohibited for system safety. Please run manual command: sudo paccache -r".to_string(),
+                ),
+            });
+            continue;
+        }
+
         // 1. Candidate must be registered in the discovered candidate set
         let candidate = match discovered.iter().find(|c| c.id == candidate_id) {
             Some(c) => c,
