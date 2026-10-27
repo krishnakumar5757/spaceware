@@ -1,0 +1,339 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate-tag:
+    name: Validate Tag & Run Tests
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract and validate tag version
+        id: version
+        run: |
+          TAG_NAME="${GITHUB_REF_NAME}"
+          VERSION="${TAG_NAME#v}"
+          echo "Tag: $TAG_NAME (extracted version: $VERSION)"
+
+          # Check package.json
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$PKG_VERSION" != "$VERSION" ]; then
+            echo "::error::package.json version ($PKG_VERSION) does not match tag version ($VERSION)"
+            exit 1
+          fi
+
+          # Check src-tauri/tauri.conf.json
+          TAURI_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          if [ "$TAURI_VERSION" != "$VERSION" ]; then
+            echo "::error::tauri.conf.json version ($TAURI_VERSION) does not match tag version ($VERSION)"
+            exit 1
+          fi
+
+          # Check src-tauri/Cargo.toml
+          CARGO_VERSION=$(grep -m1 '^version[[:space:]]*=' src-tauri/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$CARGO_VERSION" != "$VERSION" ]; then
+            echo "::error::Cargo.toml version ($CARGO_VERSION) does not match tag version ($VERSION)"
+            exit 1
+          fi
+
+          echo "Version check passed: $VERSION across all configs."
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install system dependencies for Tauri
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml -- --nocapture
+
+  build-appimage:
+    name: Build Linux AppImage
+    needs: validate-tag
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies for Tauri & AppImage
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend production bundle
+        run: npm run build
+
+      - name: Build AppImage with custom-protocol
+        run: npm run tauri build -- --bundles appimage --features tauri/custom-protocol
+
+      - name: Verify AppImage artifact
+        id: appimage-verify
+        run: |
+          VERSION="${{ needs.validate-tag.outputs.version }}"
+          APPIMAGE_PATH="src-tauri/target/release/bundle/appimage/spacewise_${VERSION}_amd64.AppImage"
+          if [ ! -f "$APPIMAGE_PATH" ]; then
+            echo "Looking for any generated AppImage in bundle directory..."
+            APPIMAGE_PATH=$(find src-tauri/target/release/bundle/appimage/ -name "*.AppImage" -type f | head -n 1)
+          fi
+
+          if [ -z "$APPIMAGE_PATH" ] || [ ! -f "$APPIMAGE_PATH" ]; then
+            echo "::error::AppImage was not generated at expected path"
+            exit 1
+          fi
+
+          ls -lh "$APPIMAGE_PATH"
+          echo "APPIMAGE_PATH=$APPIMAGE_PATH" >> "$GITHUB_ENV"
+          mkdir -p dist-release
+          cp "$APPIMAGE_PATH" dist-release/
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimage
+          path: dist-release/*.AppImage
+          if-no-files-found: error
+
+  build-arch-package:
+    name: Build Arch Linux Package
+    needs: validate-tag
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux/archlinux:latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize Pacman keyring & install dependencies
+        run: |
+          pacman-key --init
+          pacman-key --populate archlinux
+          pacman -Syu --noconfirm --needed \
+            base-devel \
+            git \
+            nodejs \
+            npm \
+            cargo \
+            rust \
+            webkit2gtk-4.1 \
+            gtk3 \
+            cairo \
+            libsoup3 \
+            gdk-pixbuf2 \
+            glib2 \
+            glibc \
+            gcc-libs \
+            hicolor-icon-theme \
+            sudo
+
+      - name: Create non-root builder user
+        run: |
+          useradd -m -G wheel builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Build Arch Linux package with makepkg
+        shell: su builder -s /bin/bash {0}
+        run: |
+          cd "$GITHUB_WORKSPACE/packaging/arch"
+          makepkg -C -f --noconfirm
+
+      - name: Validate built Arch package contents
+        run: |
+          cd "$GITHUB_WORKSPACE/packaging/arch"
+          PKG_FILE=$(find . -name "spacewise-*.pkg.tar.zst" -type f | head -n 1)
+          if [ -z "$PKG_FILE" ] || [ ! -f "$PKG_FILE" ]; then
+            echo "::error::Arch package was not produced!"
+            exit 1
+          fi
+
+          echo "Inspecting package: $PKG_FILE"
+          pacman -Qip "$PKG_FILE"
+          pacman -Qlp "$PKG_FILE"
+
+          # Verify essential files
+          pacman -Qlp "$PKG_FILE" | grep -F '/usr/bin/spacewise' || (echo "::error::Missing /usr/bin/spacewise" && exit 1)
+          pacman -Qlp "$PKG_FILE" | grep -F '/usr/share/applications/spacewise.desktop' || (echo "::error::Missing desktop entry" && exit 1)
+          pacman -Qlp "$PKG_FILE" | grep -F '/usr/share/licenses/spacewise/LICENSE' || (echo "::error::Missing license" && exit 1)
+
+          mkdir -p "$GITHUB_WORKSPACE/dist-arch"
+          cp "$PKG_FILE" "$GITHUB_WORKSPACE/dist-arch/"
+
+      - name: Upload Arch package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: arch-package
+          path: dist-arch/*.pkg.tar.zst
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [validate-tag, build-appimage, build-arch-package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download AppImage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: appimage
+          path: release-assets
+
+      - name: Download Arch package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: arch-package
+          path: release-assets
+
+      - name: Generate Checksums & Release Notes
+        run: |
+          cd release-assets
+          ls -la
+
+          # Generate SHA256SUMS.txt
+          sha256sum *.AppImage *.pkg.tar.zst > SHA256SUMS.txt
+          echo "=== Generated Checksums ==="
+          cat SHA256SUMS.txt
+
+          VERSION="${{ needs.validate-tag.outputs.version }}"
+
+          cat << 'EOF' > release-notes.md
+          ## Spacewise Release
+
+          Spacewise is a modern, transparent disk-usage analyzer and selective cleanup utility for Linux built with Tauri 2, React, TypeScript, and Rust.
+
+          ### Downloadable Artifacts
+
+          | Package Format | Filename | Description |
+          | :--- | :--- | :--- |
+          | **Standalone AppImage** | `spacewise_<version>_amd64.AppImage` | Portable binary running on any modern x86_64 Linux distribution. |
+          | **Arch Linux / CachyOS** | `spacewise-<version>-1-x86_64.pkg.tar.zst` | Native Pacman package for Arch Linux, CachyOS, and derivatives. |
+          | **Checksum Manifest** | `SHA256SUMS.txt` | Cryptographic SHA-256 hashes for all downloadable release files. |
+
+          ---
+
+          ### Installation Instructions
+
+          #### Standalone AppImage (Universal Linux)
+          1. Download the `.AppImage` file from the assets below.
+          2. Grant execution permissions:
+             ```bash
+             chmod +x spacewise_*_amd64.AppImage
+             ```
+          3. Launch the application:
+             ```bash
+             ./spacewise_*_amd64.AppImage
+             ```
+
+          #### Arch Linux & CachyOS Native Package
+          1. Download the `.pkg.tar.zst` package.
+          2. Install using Pacman:
+             ```bash
+             sudo pacman -U spacewise-*-x86_64.pkg.tar.zst
+             ```
+          3. Launch from your application menu or via terminal using `spacewise`.
+
+          #### Verify Download Checksums
+          Verify integrity against the published `SHA256SUMS.txt`:
+          ```bash
+          sha256sum -c SHA256SUMS.txt
+          ```
+
+          ---
+
+          ### Key Safety Highlights in this Release
+          - **Protected Paths & Bounded Traversal:** Root filesystem, core system directories, mount boundaries, and out-of-home paths are strictly guarded.
+          - **Transactional FreeDesktop Trash:** Safe moves with payload and metadata collision resolution to prevent accidental overwrites.
+          - **Multi-Level Confirmation:** Permanent deletion requires explicit intent with zero automated destruction.
+          - **Custom-Protocol Production Assets:** Production frontend bundle is fully embedded into the native binary without localhost dev server dependencies.
+          EOF
+
+          sed -i "s/<version>/$VERSION/g" release-notes.md
+
+      - name: Publish Release via GitHub CLI
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd release-assets
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "Spacewise ${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md \
+            *.AppImage \
+            *.pkg.tar.zst \
+            SHA256SUMS.txt

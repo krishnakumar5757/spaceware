@@ -143,7 +143,51 @@ npm run tauri build
 ```
 The compiled Linux desktop executable will be generated under `src-tauri/target/release/spacewise`.
 
-*(Note: Pre-packaged standalone distribution formats such as AppImage, Flatpak, or native distribution packages are planned for upcoming release packaging milestones and are not yet published.)*
+*(Note: Release assets will be available on the [GitHub Releases](https://github.com/krishnakumar5757/spaceware/releases) page when version tags are published.)*
+
+---
+
+## Installation & Downloads
+
+Pre-built Linux binaries and packages are provided on the [GitHub Releases](https://github.com/krishnakumar5757/spaceware/releases) page for each release tag.
+
+### 1. Standalone AppImage (Universal Linux)
+The AppImage runs portably on most modern x86_64 Linux distributions without requiring system-wide installation:
+1. Download `spacewise_<version>_amd64.AppImage` from the release assets.
+2. Mark it as executable:
+   ```bash
+   chmod +x spacewise_*_amd64.AppImage
+   ```
+3. Run directly:
+   ```bash
+   ./spacewise_*_amd64.AppImage
+   ```
+
+### 2. Arch Linux & CachyOS Native Package (`.pkg.tar.zst`)
+Users on Arch Linux, CachyOS, and EndeavourOS can install the native Pacman package:
+1. Download `spacewise-<version>-1-x86_64.pkg.tar.zst` from the release assets.
+2. Install with Pacman:
+   ```bash
+   sudo pacman -U spacewise-*-x86_64.pkg.tar.zst
+   ```
+3. Launch via your desktop application menu or by running `spacewise` in terminal.
+
+You can also build and install the package locally from source:
+```bash
+cd packaging/arch
+makepkg -si
+```
+
+### 3. Verifying Cryptographic Checksums
+Each release provides a `SHA256SUMS.txt` manifest containing SHA-256 hashes for all downloadable assets. To verify file integrity:
+```bash
+sha256sum -c SHA256SUMS.txt
+```
+
+### 4. Platform Limitations & Support
+- **Architecture:** Linux x86_64 (64-bit). ARM64/aarch64 and macOS/Windows platforms are not currently supported.
+- **Display Protocol:** Wayland and X11 are supported through GTK3 / WebKitGTK.
+- **Dependencies:** Built against WebKitGTK 4.1 (`webkit2gtk-4.1`). Ensure graphics drivers and WebKitGTK dependencies are installed.
 
 ---
 
@@ -213,13 +257,13 @@ The Rust test suite comprises 41 automated tests verifying:
 
 ## Troubleshooting
 
-- **Error: `Spacewise must not be executed with root/sudo privileges`**  
+- **Error: `Spacewise must not be executed with root/sudo privileges`**
   *Remedy:* Launch Spacewise as your regular desktop user. Root execution is prohibited to protect core system files.
-- **Error: `A cleanup operation is already in progress`**  
+- **Error: `A cleanup operation is already in progress`**
   *Remedy:* Wait for the active cleanup operation to finish before triggering another request.
-- **App fails to compile due to missing WebKitGTK / GTK packages:**  
+- **App fails to compile due to missing WebKitGTK / GTK packages:**
   *Remedy:* Ensure you have installed `webkit2gtk-4.1` and `gtk3` development libraries as detailed in the Prerequisites section.
-- **Permission Denied warnings in scan results:**  
+- **Permission Denied warnings in scan results:**
   *Remedy:* This is expected behavior when scanning directories containing files owned by other users or restricted system daemons. Spacewise safely skips unreadable entries.
 
 ---

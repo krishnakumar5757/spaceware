@@ -29,22 +29,9 @@ makedepends=(
   'npm'    # Package manager for frontend dependencies
 )
 
-# UPSTREAM SOURCE ARCHIVE & CHECKSUM PREREQUISITE:
-# The versioned release archive is downloaded from the official GitHub release tag:
-#   $url/archive/refs/tags/v$pkgver.tar.gz
-#
-# PREREQUISITE STATUS:
-# The Git tag 'v0.1.0' has NOT yet been pushed to GitHub (https://github.com/krishnakumar5757/spaceware).
-# Once the release tag is created and pushed with user approval:
-#   1. Tag and push: git tag -a v0.1.0 -m "Release v0.1.0" && git push origin v0.1.0
-#   2. Download the genuine upstream archive: curl -fLO "$url/archive/refs/tags/v$pkgver.tar.gz"
-#   3. Calculate genuine SHA-256: sha256sum "$pkgname-$pkgver.tar.gz" (or run 'updpkgsums')
-#   4. Replace the prerequisite placeholder below with the genuine checksum.
-#
-# DO NOT submit this PKGBUILD to the AUR until the tag is pushed and the real checksum is verified.
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "spacewise.desktop")
-sha256sums=('PREREQUISITE_CALCULATE_AFTER_TAG_PUSH'
+sha256sums=('edeb2fe1425843d109192a581a1dd449fda2d69540d8b5fac4a4af715f2cad21'
             'ce3c2813e70fb5481b32f45bd87282abc63b3b3ba51e686d52b2ec41f6fd42ae')
 
 prepare() {

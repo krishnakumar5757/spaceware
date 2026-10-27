@@ -1,0 +1,26 @@
+pkgbase = spacewise
+	pkgdesc = Modern disk usage analyzer and selective cleanup desktop utility
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/krishnakumar5757/spaceware
+	arch = x86_64
+	license = MIT
+	makedepends = cargo
+	makedepends = rust
+	makedepends = nodejs
+	makedepends = npm
+	depends = webkit2gtk-4.1
+	depends = gtk3
+	depends = cairo
+	depends = libsoup3
+	depends = gdk-pixbuf2
+	depends = glib2
+	depends = glibc
+	depends = gcc-libs
+	depends = hicolor-icon-theme
+	source = spacewise-0.1.0.tar.gz::https://github.com/krishnakumar5757/spaceware/archive/refs/tags/v0.1.0.tar.gz
+	source = spacewise.desktop
+	sha256sums = edeb2fe1425843d109192a581a1dd449fda2d69540d8b5fac4a4af715f2cad21
+	sha256sums = ce3c2813e70fb5481b32f45bd87282abc63b3b3ba51e686d52b2ec41f6fd42ae
+
+pkgname = spacewise
