@@ -29,41 +29,27 @@ makedepends=(
   'npm'    # Package manager for frontend dependencies
 )
 
-# SOURCE AND CHECKSUM LIMITATIONS (LOCAL PRE-RELEASE STAGE):
-# An official Git release tag (e.g. v0.1.0) has not yet been tagged or published
-# on GitHub (https://github.com/krishnakumar5757/spaceware).
+# UPSTREAM SOURCE ARCHIVE & CHECKSUM PREREQUISITE:
+# The versioned release archive is downloaded from the official GitHub release tag:
+#   $url/archive/refs/tags/v$pkgver.tar.gz
 #
-# To avoid fabricating fake tarball URLs or placeholder checksums, this PKGBUILD
-# builds from the local repository working tree snapshot (${startdir}/../..).
+# PREREQUISITE STATUS:
+# The Git tag 'v0.1.0' has NOT yet been pushed to GitHub (https://github.com/krishnakumar5757/spaceware).
+# Once the release tag is created and pushed with user approval:
+#   1. Tag and push: git tag -a v0.1.0 -m "Release v0.1.0" && git push origin v0.1.0
+#   2. Download the genuine upstream archive: curl -fLO "$url/archive/refs/tags/v$pkgver.tar.gz"
+#   3. Calculate genuine SHA-256: sha256sum "$pkgname-$pkgver.tar.gz" (or run 'updpkgsums')
+#   4. Replace the prerequisite placeholder below with the genuine checksum.
 #
-# UPSTREAM DISTRIBUTION NOTE:
-# Once the upstream tag v0.1.0 is published on GitHub, update source and sha256sums to:
-#   source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
-#           "spacewise.desktop")
-#   sha256sums=('<actual_github_tarball_sha256>'
-#               'ce3c2813e70fb5481b32f45bd87282abc63b3b3ba51e686d52b2ec41f6fd42ae')
-source=("spacewise.desktop")
-sha256sums=('ce3c2813e70fb5481b32f45bd87282abc63b3b3ba51e686d52b2ec41f6fd42ae')
+# DO NOT submit this PKGBUILD to the AUR until the tag is pushed and the real checksum is verified.
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+        "spacewise.desktop")
+sha256sums=('PREREQUISITE_CALCULATE_AFTER_TAG_PUSH'
+            'ce3c2813e70fb5481b32f45bd87282abc63b3b3ba51e686d52b2ec41f6fd42ae')
 
 prepare() {
-  local _srcroot
-  _srcroot="$(cd "${startdir}/../.." && pwd -P)"
-
-  # Prepare a clean build tree inside $srcdir
-  cd "$srcdir"
-  rm -rf "$pkgname-$pkgver"
-  mkdir -p "$pkgname-$pkgver"
-
-  # Snapshot the repository source files, excluding build artifacts and version control
-  tar --exclude='./src-tauri/target' \
-      --exclude='./node_modules' \
-      --exclude='./dist' \
-      --exclude='./.git' \
-      --exclude='./.vscode' \
-      --exclude='./packaging' \
-      -cf - -C "$_srcroot" . | tar -xf - -C "$pkgname-$pkgver"
-
-  cd "$pkgname-$pkgver"
+  # GitHub release tarballs unpack into '<repo_name>-<version>'
+  cd "$srcdir"/${url##*/}-$pkgver 2>/dev/null || cd "$srcdir"/$pkgname-$pkgver
 
   # Step 1: Install frontend dependencies from lockfile
   npm ci
@@ -73,31 +59,31 @@ prepare() {
 }
 
 build() {
-  cd "$srcdir/$pkgname-$pkgver"
+  cd "$srcdir"/${url##*/}-$pkgver 2>/dev/null || cd "$srcdir"/$pkgname-$pkgver
 
   # Step 1: Build production frontend assets into dist/
   npm run build
 
   # Step 2: Build native Rust binary in release mode with embedded frontend assets
-  # tauri_build in build.rs embeds frontendDist (../dist) directly into the binary
-  cargo build --frozen --release --manifest-path src-tauri/Cargo.toml
+  # Activating tauri/custom-protocol ensures production mode (disabling devUrl and embedding frontendDist)
+  cargo build --frozen --release --manifest-path src-tauri/Cargo.toml --features tauri/custom-protocol
 }
 
 package() {
-  cd "$srcdir/$pkgname-$pkgver"
-  
+  cd "$srcdir"/${url##*/}-$pkgver 2>/dev/null || cd "$srcdir"/$pkgname-$pkgver
+
   # 1. Native Executable
   install -Dm755 "src-tauri/target/release/spacewise" "$pkgdir/usr/bin/spacewise"
-  
+
   # 2. XDG Desktop Entry
   install -Dm644 "$srcdir/spacewise.desktop" "$pkgdir/usr/share/applications/spacewise.desktop"
-  
+
   # 3. Hicolor Icons (verified dimensions in src-tauri/icons/)
   install -Dm644 "src-tauri/icons/32x32.png" "$pkgdir/usr/share/icons/hicolor/32x32/apps/spacewise.png"
   install -Dm644 "src-tauri/icons/128x128.png" "$pkgdir/usr/share/icons/hicolor/128x128/apps/spacewise.png"
   install -Dm644 "src-tauri/icons/128x128@2x.png" "$pkgdir/usr/share/icons/hicolor/256x256/apps/spacewise.png"
   install -Dm644 "src-tauri/icons/icon.png" "$pkgdir/usr/share/icons/hicolor/512x512/apps/spacewise.png"
-  
+
   # 4. MIT License (required by Arch Linux packaging guidelines for MIT)
   install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
